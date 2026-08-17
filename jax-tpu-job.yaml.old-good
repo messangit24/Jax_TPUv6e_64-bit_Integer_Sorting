@@ -1,0 +1,139 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: jax-tpu-svc
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    job-name: jax-tpu-benchmark
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: jax-tpu-benchmark
+spec:
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        job-name: jax-tpu-benchmark
+    spec:
+      subdomain: jax-tpu-svc
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: 4x4
+        cloud.google.com/gke-nodepool: mb-tpu-v6e-multi-16
+      containers:
+        - name: jax-tpu-container
+          image: europe-west4-docker.pkg.dev/mb-development-447000/openshmem-benchmarks/tpu-jax-sort:v1
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              cat << 'EOF' > /app/tpu_jax_sort.py
+              import jax
+              import jax.numpy as jnp
+              from jax.sharding import Mesh, PartitionSpec as P
+              from jax.experimental import shard_map
+              import time
+              import os
+              import json
+
+              # 800,000,000 elements * 8 bytes = 6.4 GB per chip
+              # 6.4 GB * 16 Chips = 102.4 GB Total Dataset
+              ELEMENTS_PER_CHIP = 800_000_000
+
+              def main():
+                  # Initialize JAX distributed cluster on GKE
+                  coordinator = "jax-tpu-benchmark-0.jax-tpu-svc.default.svc.cluster.local:1234"
+                  process_id = int(os.environ.get("JOB_COMPLETION_INDEX", 0))
+                  
+                  jax.distributed.initialize(
+                      coordinator_address=coordinator,
+                      num_processes=4,
+                      process_id=process_id
+                  )
+                  
+                  devices = jax.devices()
+                  mesh = Mesh(devices, ('x',))
+                  
+                  print(f"Pod {process_id} connected to TPU Fabric. Local chips: {jax.local_device_count()}, Total chips: {jax.device_count()}")
+                  
+                  # 1. Generate Synthetic Data
+                  key = jax.random.PRNGKey(process_id)
+                  local_keys = jax.random.bits(key, (ELEMENTS_PER_CHIP,), dtype=jnp.uint64)
+                  jax.block_until_ready(local_keys)
+                  
+                  def sort_and_exchange(x):
+                      # Local chunk sort
+                      x = jnp.sort(x)
+                      # Reshape into buckets for ICI fabric transfer
+                      x = x.reshape((jax.device_count(), -1))
+                      # All-to-All silicon optical exchange
+                      x = jax.lax.all_to_all(x, 'x', 0, 0)
+                      # Final local sort
+                      x = x.flatten()
+                      return jnp.sort(x)
+                      
+                  @jax.jit
+                  def dist_sort(x):
+                      return shard_map.shard_map(
+                          sort_and_exchange,
+                          mesh=mesh,
+                          in_specs=P('x'),
+                          out_specs=P('x'),
+                          check_rep=False
+                      )(x)
+                      
+                  print(f"Pod {process_id} starting distributed sort...")
+                  
+                  start_time = time.time()
+                  sorted_keys = dist_sort(local_keys)
+                  jax.block_until_ready(sorted_keys)
+                  end_time = time.time()
+                  
+                  total_time = end_time - start_time
+                  total_gb = (ELEMENTS_PER_CHIP * 8 * jax.device_count()) / 1e9
+                  
+                  if process_id == 0:
+                      metrics = {
+                          "option": "Option 2 (Native TPU Silicon JAX)",
+                          "data_gb": total_gb,
+                          "execution_seconds": total_time,
+                          "throughput_gbps": total_gb / total_time,
+                          "compliant": False,
+                          "memory_location": "TPU HBM3",
+                          "interconnect": "ICI Fabric"
+                      }
+                      with open("/tmp/option2_metrics.json", "w") as f:
+                          json.dump(metrics, f, indent=2)
+                      
+                      print("\n=======================================================")
+                      print(f"Option 2 JAX Sort completed successfully in {total_time:.4f} seconds.")
+                      print(f"Total Data Processed: {total_gb:.2f} GB")
+                      print(f"Effective Throughput: {metrics['throughput_gbps']:.2f} GB/s")
+                      print("=======================================================\n")
+
+              if __name__ == "__main__":
+                  main()
+              EOF
+              
+              # Allow headless DNS records to propagate
+              sleep 10
+              python3 /app/tpu_jax_sort.py
+          env:
+            - name: JOB_COMPLETION_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+          resources:
+            limits:
+              google.com/tpu: "4"
+              memory: "150Gi"
+            requests:
+              google.com/tpu: "4"
+              cpu: "8"
+              memory: "150Gi"

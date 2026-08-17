@@ -1,0 +1,22 @@
+[POD 0] Initializing JAX distributed cluster...
+[POD 0] Connected. Total TPU chips across cluster: 16.
+[POD 0] [PHASE 1] Generating 64-bit integers in TPU HBM...
+[POD 0] [PHASE 2] Exchanging buckets via ICI and sorting...
+
+=======================================================
+PHASE-BY-PHASE BENCHMARK METRICS
+=======================================================
+Total Dataset Size             : 6.40 GB
+Global Validation Status       : [PASSED]
+-------------------------------------------------------
+PHASE 1: 64-Bit Integer Generation (In-HBM)
+  Execution Time               : 1.6887 seconds
+  HBM Generation Throughput    : 3.79 GB/s
+  ICI Network Traffic          : 0.00 GB
+-------------------------------------------------------
+PHASE 2: ICI Exchange & Bucket Sorting
+  Execution Time               : 102.8623 seconds
+  ICI Network Traffic Routed   : 6.00 GB
+  Effective ICI Network Speed  : 0.06 GB/s
+  Effective Memory Bandwidth   : 0.37 GB/s
+=======================================================

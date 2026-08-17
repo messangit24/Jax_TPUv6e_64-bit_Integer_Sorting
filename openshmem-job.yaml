@@ -1,0 +1,212 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: openshmem-cpu-benchmark
+spec:
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      labels:
+        job-name: openshmem-cpu-benchmark
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: mb-tpu-v6e-multi-16
+      tolerations:
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+      containers:
+        - name: openshmem-container
+          image: europe-west4-docker.pkg.dev/mb-development-447000/openshmem-benchmarks/openshmem-sort:v1
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: dshm
+          env:
+            - name: SHMEM_SYMMETRIC_SIZE
+              value: "1073741824"  # Pre-allocate 1GB contiguous symmetric heap per PE
+            - name: UCX_TLS
+              value: "sm,self"     # Force shared-memory transports
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              
+              cat << 'EOF' > /tmp/openshmem_sort.c
+              #include <stdio.h>
+              #include <stdlib.h>
+              #include <stdint.h>
+              #include <time.h>
+              #include <shmem.h>
+
+              #define ELEMENTS_PER_PE 50000000UL // 50M * 8 bytes = 400 MB per PE (6.4 GB total across 16 PEs)
+
+              double get_wtime(void) {
+                  struct timespec ts;
+                  clock_gettime(CLOCK_MONOTONIC, &ts);
+                  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+              }
+
+              int compare_uint64(const void *a, const void *b) {
+                  uint64_t arg1 = *(const uint64_t *)a;
+                  uint64_t arg2 = *(const uint64_t *)b;
+                  if (arg1 < arg2) return -1;
+                  if (arg1 > arg2) return 1;
+                  return 0;
+              }
+
+              int main(int argc, char *argv[]) {
+                  shmem_init();
+                  
+                  int me = shmem_my_pe();
+                  int npes = shmem_n_pes();
+                  
+                  uint64_t total_elements = ELEMENTS_PER_PE * npes;
+                  double total_data_gb = (double)(total_elements * sizeof(uint64_t)) / 1e9;
+                  double network_traffic_gb = total_data_gb * ((double)(npes - 1) / npes);
+                  
+                  // Allocate symmetric heap buffers in Host DRAM
+                  uint64_t *local_keys = (uint64_t *)shmem_malloc(ELEMENTS_PER_PE * sizeof(uint64_t));
+                  uint64_t *rx_buffer  = (uint64_t *)shmem_malloc(ELEMENTS_PER_PE * sizeof(uint64_t));
+                  
+                  if (!local_keys || !rx_buffer) {
+                      printf("PE %d failed to allocate symmetric memory heap.\n", me);
+                      shmem_global_exit(1);
+                  }
+                  
+                  shmem_barrier_all();
+                  
+                  // -------------------------------------------------------------
+                  // PHASE 1: IN-DRAM 64-BIT INTEGER GENERATION
+                  // -------------------------------------------------------------
+                  double gen_start = get_wtime();
+                  
+                  unsigned int seed = 42 + me;
+                  uint64_t keys_per_bucket = ELEMENTS_PER_PE / npes;
+                  
+                  for (int b = 0; b < npes; b++) {
+                      uint64_t prefix = ((uint64_t)b) << 60;
+                      for (uint64_t i = 0; i < keys_per_bucket; i++) {
+                          uint64_t idx = b * keys_per_bucket + i;
+                          uint64_t rand_val = (((uint64_t)rand_r(&seed)) << 32) | rand_r(&seed);
+                          rand_val &= 0x0FFFFFFFFFFFFFFF; // Clear top 4 bits
+                          local_keys[idx] = rand_val | prefix;
+                      }
+                  }
+                  
+                  shmem_barrier_all();
+                  double gen_end = get_wtime();
+                  double t_gen = gen_end - gen_start;
+                  
+                  // -------------------------------------------------------------
+                  // PHASE 2: ONE-SIDED RDMA BUCKET EXCHANGE & LOCAL SORTING
+                  // -------------------------------------------------------------
+                  double sort_start = get_wtime();
+                  
+                  // Pre-sort local buckets
+                  qsort(local_keys, ELEMENTS_PER_PE, sizeof(uint64_t), compare_uint64);
+                  
+                  // Push target buckets to remote PEs via single-sided RDMA
+                  for (int target_pe = 0; target_pe < npes; target_pe++) {
+                      uint64_t offset = target_pe * keys_per_bucket;
+                      uint64_t remote_offset = me * keys_per_bucket;
+                      shmem_put64(&rx_buffer[remote_offset], &local_keys[offset], keys_per_bucket, target_pe);
+                  }
+                  
+                  shmem_barrier_all();
+                  
+                  // Final local sort on aggregated bucket
+                  qsort(rx_buffer, ELEMENTS_PER_PE, sizeof(uint64_t), compare_uint64);
+                  
+                  shmem_barrier_all();
+                  double sort_end = get_wtime();
+                  double t_sort = sort_end - sort_start;
+                  
+                  // -------------------------------------------------------------
+                  // GLOBAL VALIDATION CHECK
+                  // -------------------------------------------------------------
+                  static uint64_t max_val;
+                  static uint64_t min_val;
+                  static uint64_t all_mins[256];
+                  static uint64_t all_maxes[256];
+                  
+                  max_val = rx_buffer[ELEMENTS_PER_PE - 1];
+                  min_val = rx_buffer[0];
+                  
+                  shmem_fcollect64(all_mins, &min_val, 1, 0, 0, npes, NULL);
+                  shmem_fcollect64(all_maxes, &max_val, 1, 0, 0, npes, NULL);
+                  
+                  int global_passed = 1;
+                  if (me == 0) {
+                      for (int i = 0; i < npes - 1; i++) {
+                          if (all_maxes[i] > all_mins[i + 1]) {
+                              global_passed = 0;
+                              break;
+                          }
+                      }
+                      
+                      double gen_gbps = total_data_gb / t_gen;
+                      double net_gbps = network_traffic_gb / t_sort;
+                      double mem_gbps = (total_data_gb * 3) / t_sort;
+                      
+                      printf("\n=======================================================\n");
+                      printf("OPENSHMEM PHASE-BY-PHASE BENCHMARK METRICS\n");
+                      printf("=======================================================\n");
+                      printf("Total Dataset Size             : %.2f GB\n", total_data_gb);
+                      printf("Total Processing Elements (PEs): %d\n", npes);
+                      printf("Global Validation Status       : %s\n", global_passed ? "[PASSED]" : "[FAILED]");
+                      printf("-------------------------------------------------------\n");
+                      printf("PHASE 1: 64-Bit Integer Generation (Host DRAM)\n");
+                      printf("  Execution Time               : %.4f seconds\n", t_gen);
+                      printf("  DRAM Generation Throughput   : %.2f GB/s\n", gen_gbps);
+                      printf("  Network Traffic              : 0.00 GB\n");
+                      printf("-------------------------------------------------------\n");
+                      printf("PHASE 2: One-Sided RDMA Exchange & Bucket Sorting\n");
+                      printf("  Execution Time               : %.4f seconds\n", t_sort);
+                      printf("  Network Traffic Routed       : %.2f GB\n", network_traffic_gb);
+                      printf("  Effective Network Speed      : %.2f GB/s\n", net_gbps);
+                      printf("  Effective DRAM Bandwidth     : %.2f GB/s\n", mem_gbps);
+                      printf("=======================================================\n\n");
+                  }
+                  
+                  shmem_free(local_keys);
+                  shmem_free(rx_buffer);
+                  shmem_finalize();
+                  return 0;
+              }
+              EOF
+              
+              echo "Compiling OpenSHMEM benchmark C code..."
+              if command -v oshcc >/dev/null 2>&1; then
+                  oshcc -O3 -o /tmp/shmem_sort /tmp/openshmem_sort.c
+              else
+                  mpicc -O3 -o /tmp/shmem_sort /tmp/openshmem_sort.c -lshmem -lmpi
+              fi
+              
+              echo "Executing 16 OpenSHMEM PEs on Host DRAM..."
+              # Pass MCA flags to override UCX segment limits and use shared memory
+              if command -v oshrun >/dev/null 2>&1; then
+                  oshrun -np 16 --allow-run-as-root \
+                    --mca pml ob1 \
+                    --mca btl self,vader \
+                    --mca memheap_base_max_segments 128 \
+                    /tmp/shmem_sort
+              else
+                  mpirun -np 16 --allow-run-as-root \
+                    --mca pml ob1 \
+                    --mca btl self,vader \
+                    --mca memheap_base_max_segments 128 \
+                    /tmp/shmem_sort
+              fi
+          resources:
+            limits:
+              cpu: "16"
+              memory: "64Gi"
+            requests:
+              cpu: "16"
+              memory: "64Gi"

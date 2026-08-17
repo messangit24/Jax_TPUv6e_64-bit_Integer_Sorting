@@ -1,0 +1,10 @@
+  local_keys = jax.random.bits(key, (ELEMENTS_PER_CHIP,), dtype=jnp.uint64)
+Pod 0 connected to TPU Fabric. Local chips: 4, Total chips: 16
+Pod 0 starting distributed sort...
+
+=======================================================
+Option 2 JAX Sort completed successfully in 47.0692 seconds.
+Total Data Processed: 102.40 GB
+Effective Throughput: 2.18 GB/s
+=======================================================
+

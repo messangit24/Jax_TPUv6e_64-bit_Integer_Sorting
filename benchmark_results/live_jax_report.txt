@@ -1,0 +1,43 @@
+2026-08-10 21:36:24.374717: E external/xla/xla/tsl/distributed_runtime/coordination/coordination_service.cc:1798] Shutdown barrier in coordination service has failed:
+DEADLINE_EXCEEDED: Barrier timed out. Id: Shutdown::11625976033560676307::0. This usually happens because a task triggered the barrier too early or too slowly. Please look at the task logs (both timed out and first task) to debug further.
+# of tasks that reached the barrier: 3/4.
+The first task at the barrier: /job:jax_worker/replica:0/task:1. Some timed out task names:
+/job:jax_worker/replica:0/task:0
+ [type.googleapis.com/tensorflow.BarrierError='\n\x1eShutdown::11625976033560676307'] [type.googleapis.com/tensorflow.CoordinationServiceError='']
+This suggests that the workers are out of sync. Either at least one worker (a) crashed early due to program error or scheduler events (e.g. preemption, eviction), (b) was too fast in its execution, or (c) too slow / hanging. Check the logs (both the program and scheduler events) for an earlier error to identify the root cause.
+2026-08-10 21:36:24.374745: E external/xla/xla/tsl/distributed_runtime/coordination/coordination_service.cc:1839] Use error polling to propagate the following error to all tasks: INTERNAL: Shutdown barrier has failed.
+Barrier result: 'DEADLINE_EXCEEDED: Barrier timed out. Id: Shutdown::11625976033560676307::0. This usually happens because a task triggered the barrier too early or too slowly. Please look at the task logs (both timed out and first task) to debug further.
+# of tasks that reached the barrier: 3/4.
+The first task at the barrier: /job:jax_worker/replica:0/task:1. Some timed out task names:
+/job:jax_worker/replica:0/task:0
+ [type.googleapis.com/tensorflow.BarrierError='\n\x1eShutdown::11625976033560676307'] [type.googleapis.com/tensorflow.CoordinationServiceError=''] [type.googleapis.com/tensorflow.CoordinationServiceError='']
+2026-08-10 21:36:24.374864: E external/xla/xla/tsl/distributed_runtime/coordination/coordination_service_agent.cc:429] Polled an error from coordination service (this can be an error from this or another task).
+2026-08-10 21:36:24.374972: F external/xla/xla/pjrt/distributed/client.h:88] Terminating process because the JAX distributed service detected fatal errors. This most likely indicates that another task died; see the other task logs for more details. Disable Python buffering, i.e. `python -u`, to be sure to see all the previous output. absl::Status: INTERNAL: Shutdown barrier has failed.
+Barrier result: 'DEADLINE_EXCEEDED: Barrier timed out. Id: Shutdown::11625976033560676307::0. This usually happens because a task triggered the barrier too early or too slowly. Please look at the task logs (both timed out and first task) to debug further.
+# of tasks that reached the barrier: 3/4.
+The first task at the barrier: /job:jax_worker/replica:0/task:1. Some timed out task names:
+/job:jax_worker/replica:0/task:0
+ [type.googleapis.com/tensorflow.BarrierError='\n\x1eShutdown::11625976033560676307'] [type.googleapis.com/tensorflow.CoordinationServiceError='']
+
+RPC: /tensorflow.CoordinationService/PollForError [type.googleapis.com/tensorflow.CoordinationServiceError='']
+https://symbolize.stripped_domain/r/?trace=7dcef33dc95c,7dcef3387def,7dce4d60e20f,7dce438d4e8a,7dce43f80aa5,7dce4a45b669,7dce4a46402b,7dce43f86562,7dce43f81c7b,7dce4d49e46e,7dcef33dab7a&map= 
+*** SIGABRT received by PID 1 (TID 81) on cpu 79 from PID 1; stack trace: ***
+PC: @     0x7dcef33dc95c  (unknown)  (unknown)
+    @     0x7dcdfedb47e5       1904  (unknown)
+    @     0x7dcef3387df0       3360  (unknown)
+    @     0x7dce4d60e210         16  tsl::internal::LogMessageFatal::~LogMessageFatal()
+    @     0x7dce438d4e8b        432  std::_Function_handler<>::_M_invoke()
+    @     0x7dce43f80aa6         32  std::_Function_handler<>::_M_invoke()
+    @     0x7dce4a45b66a         48  tsl::CoordinationServiceAgent::SetError()
+    @     0x7dce4a46402c        448  std::_Function_handler<>::_M_invoke()
+    @     0x7dce43f86563        672  tsl::RPCState<>::OnCompleted()
+    @     0x7dce43f81c7c        480  absl::lts_20230802::internal_any_invocable::LocalInvoker<>()
+    @     0x7dce4d49e46f         48  tsl::(anonymous namespace)::PThread::ThreadFn()
+    @     0x7dcef33dab7b  (unknown)  (unknown)
+https://symbolize.stripped_domain/r/?trace=7dcef33dc95c,7dcdfedb47e4,7dcef3387def,7dce4d60e20f,7dce438d4e8a,7dce43f80aa5,7dce4a45b669,7dce4a46402b,7dce43f86562,7dce43f81c7b,7dce4d49e46e,7dcef33dab7a&map= 
+E0810 21:36:24.418129      81 coredump_hook.cc:301] RAW: Remote crash data gathering hook invoked.
+E0810 21:36:24.418141      81 client.cc:270] RAW: Coroner client retries enabled, will retry for up to 30 sec.
+E0810 21:36:24.418144      81 coredump_hook.cc:396] RAW: Sending fingerprint to remote end.
+E0810 21:36:24.418166      81 coredump_hook.cc:405] RAW: Cannot send fingerprint to Coroner: [NOT_FOUND] stat failed on crash reporting socket /var/google/services/logmanagerd/remote_coredump.socket (Is the listener running?): No such file or directory
+E0810 21:36:24.418171      81 coredump_hook.cc:457] RAW: Dumping core locally.
+E0810 21:36:32.777586      81 process_state.cc:808] RAW: Raising signal 6 with default behavior

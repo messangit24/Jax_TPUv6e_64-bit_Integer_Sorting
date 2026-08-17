@@ -1,0 +1,214 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: jax-tpu-svc
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    job-name: jax-tpu-benchmark
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: jax-tpu-benchmark
+spec:
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        job-name: jax-tpu-benchmark
+    spec:
+      subdomain: jax-tpu-svc
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: 4x4
+        cloud.google.com/gke-nodepool: mb-tpu-v6e-multi-16
+      containers:
+        - name: jax-tpu-container
+          image: europe-west4-docker.pkg.dev/mb-development-447000/openshmem-benchmarks/tpu-jax-sort:v1
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              cat << 'EOF' > /app/tpu_jax_sort.py
+              import jax
+              jax.config.update("jax_enable_x64", True)
+              
+              import jax.numpy as jnp
+              from jax.sharding import Mesh, PartitionSpec as P
+              from jax.experimental import shard_map
+              import time
+              import os
+              import json
+
+              # 50,000,000 elements * 8 bytes = 0.4 GB per chip
+              # 0.4 GB * 16 Chips = 6.4 GB Total Dataset
+              ELEMENTS_PER_CHIP = 50_000_000
+
+              def main():
+                  coordinator = "jax-tpu-benchmark-0.jax-tpu-svc.default.svc.cluster.local:1234"
+                  process_id = int(os.environ.get("JOB_COMPLETION_INDEX", 0))
+                  
+                  print(f"[POD {process_id}] Initializing JAX distributed cluster...", flush=True)
+                  jax.distributed.initialize(
+                      coordinator_address=coordinator,
+                      num_processes=4,
+                      process_id=process_id,
+                      initialization_timeout=1800
+                  )
+                  
+                  devices = jax.devices()
+                  num_devices = len(devices)
+                  mesh = Mesh(devices, ('x',))
+                  print(f"[POD {process_id}] Connected. Total TPU chips across cluster: {num_devices}.", flush=True)
+
+                  # STEP 1: GENERATE UNIFORM BUCKET-ROUTED INTEGERS IN TPU HBM
+                  def _gen_kernel():
+                      dev_idx = jax.lax.axis_index('x')
+                      key = jax.random.fold_in(jax.random.PRNGKey(42), dev_idx)
+                      
+                      # Generate a 2D matrix: [num_devices, elements_per_bucket]
+                      keys_per_bucket = ELEMENTS_PER_CHIP // num_devices
+                      k = jax.random.bits(key, (num_devices, keys_per_bucket), dtype=jnp.uint64)
+                      
+                      # Clear top 4 bits
+                      mask = jnp.array(0x0FFFFFFFFFFFFFFF, dtype=jnp.uint64)
+                      k = jnp.bitwise_and(k, mask)
+                      
+                      # Stamp bucket IDs (0 to 15) into top 4 bits for uniform routing
+                      bucket_ids = jnp.arange(num_devices, dtype=jnp.uint64)[:, None]
+                      prefixes = jnp.left_shift(bucket_ids, 60)
+                      return jnp.bitwise_or(k, prefixes)
+
+                  @jax.jit
+                  def step1_generate_keys():
+                      return shard_map.shard_map(
+                          _gen_kernel, mesh=mesh, in_specs=(), out_specs=P('x'), check_rep=False
+                      )()
+
+                  # STEP 2: SPREAD 64-BIT INTEGERS OVER OPTICAL ICI NETWORK
+                  def _exchange_kernel(keys):
+                      # Sort buckets locally before network move
+                      keys = jnp.sort(keys, axis=-1)
+                      # Optical ICI All-to-All Exchange (Bucket i goes to Chip i)
+                      return jax.lax.all_to_all(keys, 'x', 0, 0)
+
+                  @jax.jit
+                  def step2_distribute_buckets(keys):
+                      return shard_map.shard_map(
+                          _exchange_kernel, mesh=mesh, in_specs=P('x'), out_specs=P('x'), check_rep=False
+                      )(keys)
+
+                  # STEP 3: SORT BUCKETS FROM CHIP 0 TO CHIP 15 & VERIFY BOUNDARIES
+                  def _sort_and_verify_kernel(keys):
+                      # Flatten received buckets and perform final local sort
+                      flat_keys = keys.flatten()
+                      sorted_k = jnp.sort(flat_keys)
+                      
+                      # 1. Local Sort Check
+                      local_ok = jnp.all(sorted_k[:-1] <= sorted_k[1:])
+                      
+                      # 2. Extract Min and Max boundaries
+                      l_min = sorted_k[0:1]
+                      l_max = sorted_k[-1:]
+                      
+                      # Gather min/max boundaries across neighboring TPU chips
+                      all_mins = jax.lax.all_gather(l_min, 'x', tiled=True)
+                      all_maxes = jax.lax.all_gather(l_max, 'x', tiled=True)
+                      all_flags = jax.lax.all_gather(jnp.array([local_ok], dtype=jnp.int32), 'x', tiled=True)
+                      
+                      # Global Check: max(Chip k) <= min(Chip k+1)
+                      boundaries_ok = jnp.all(all_maxes[:-1] <= all_mins[1:])
+                      global_ok = jnp.logical_and(jnp.all(all_flags == 1), boundaries_ok)
+                      return jnp.where(global_ok, 1, 0)
+
+                  @jax.jit
+                  def step3_sort_and_verify(keys):
+                      return shard_map.shard_map(
+                          _sort_and_verify_kernel, mesh=mesh, in_specs=P('x'), out_specs=P(), check_rep=False
+                      )(keys)
+
+                  # EXECUTION PIPELINE
+                  print(f"[POD {process_id}] [STEP 1/4] Generating 64-bit integers in TPU HBM...", flush=True)
+                  raw_keys = step1_generate_keys()
+                  jax.block_until_ready(raw_keys)
+
+                  print(f"[POD {process_id}] [STEP 2/4] Distributing 64-bit keys across 16 TPU chips via ICI...", flush=True)
+                  start_time = time.time()
+                  shuffled_keys = step2_distribute_buckets(raw_keys)
+                  jax.block_until_ready(shuffled_keys)
+
+                  print(f"[POD {process_id}] [STEP 3/4] Sorting buckets locally from Chip 0 to Chip 15...", flush=True)
+                  valid_scalar = step3_sort_and_verify(shuffled_keys)
+                  jax.block_until_ready(valid_scalar)
+                  end_time = time.time()
+
+                  # Synchronize all 4 pods on scalar evaluation before printing
+                  is_passed_int = int(valid_scalar)
+
+                  # STEP 4: OUTPUT METRICS & CLEAN SHUTDOWN
+                  print(f"[POD {process_id}] [STEP 4/4] Generating output metrics...", flush=True)
+                  if process_id == 0:
+                      total_time = end_time - start_time
+                      total_data_gb = (ELEMENTS_PER_CHIP * 8 * num_devices) / 1e9
+                      validation_passed = (is_passed_int == 1)
+                      
+                      network_fraction = (num_devices - 1) / num_devices
+                      network_traffic_gb = total_data_gb * network_fraction
+                      memory_traffic_gb = total_data_gb * 6  
+
+                      metrics = {
+                          "benchmark": "JAX Sequential 4-Step Distributed Bucket Sort",
+                          "total_chips": num_devices,
+                          "data_gb": total_data_gb,
+                          "execution_seconds": total_time,
+                          "throughput_gbps": total_data_gb / total_time,
+                          "network_fabric_injected_gb": network_traffic_gb,
+                          "effective_network_gbps": network_traffic_gb / total_time,
+                          "effective_memory_bandwidth_gbps": memory_traffic_gb / total_time,
+                          "global_validation_passed": validation_passed
+                      }
+                      
+                      with open("/tmp/jax_metrics.json", "w") as f:
+                          json.dump(metrics, f, indent=2)
+                      
+                      print("\n=======================================================", flush=True)
+                      print("BENCHMARK COMPLETED SUCCESSFULLY!", flush=True)
+                      print("=======================================================", flush=True)
+                      print(f"Execution Time         : {total_time:.4f} seconds", flush=True)
+                      print(f"Total Data Processed   : {total_data_gb:.2f} GB", flush=True)
+                      print(f"Global Validation      : {'[PASSED]' if validation_passed else '[FAILED]'} (Chip 0 -> Chip 15 Ascending)", flush=True)
+                      print(f"ICI Network Traffic    : {network_traffic_gb:.2f} GB", flush=True)
+                      print(f"Effective Network Speed: {metrics['effective_network_gbps']:.2f} GB/s", flush=True)
+                      print(f"HBM Memory Bandwidth   : {metrics['effective_memory_bandwidth_gbps']:.2f} GB/s", flush=True)
+                      print("=======================================================\n", flush=True)
+
+                  time.sleep(2)
+                  jax.distributed.shutdown()
+
+              if __name__ == "__main__":
+                  main()
+              EOF
+              
+              sleep 5
+              python3 -u /app/tpu_jax_sort.py
+          env:
+            - name: JOB_COMPLETION_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: JAX_COORDINATION_SERVICE_TIMEOUT_S
+              value: "1800"
+          resources:
+            limits:
+              google.com/tpu: "4"
+              memory: "150Gi"
+            requests:
+              google.com/tpu: "4"
+              cpu: "8"
+              memory: "150Gi"
