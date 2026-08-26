@@ -38,7 +38,8 @@ The benchmark runs across three distinct phases:
 | **Software Stack** | Python 3, JAX (`jaxlib` 0.5.2), XLA Compiler, GKE Kueue/Job Operator |
 
 ## Latest Benchmark Results (100 GB Scale Validation Run)
-
+> Result of the benchmarks
+> 
 =======================================================
 PHASE-BY-PHASE BENCHMARK METRICS REPORT
 =======================================================
@@ -59,4 +60,3 @@ PHASE 2: ICI Exchange & Bucket Sorting
   Effective ICI Network Speed  : 4.39 GB/s
   Effective Memory Bandwidth   : 28.12 GB/s
 =======================================================
-
