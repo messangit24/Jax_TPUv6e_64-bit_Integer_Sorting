@@ -37,9 +37,11 @@ The benchmark runs across three distinct phases:
 | **Interconnect** | Optical Circuit Interconnect (ICI) |
 | **Software Stack** | Python 3, JAX (`jaxlib` 0.5.2), XLA Compiler, GKE Kueue/Job Operator |
 
+---
+
 ## Latest Benchmark Results (100 GB Scale Validation Run)
 
-* Result of the benchmarks 
+```text
 =======================================================
 PHASE-BY-PHASE BENCHMARK METRICS REPORT
 =======================================================
@@ -49,14 +51,14 @@ Total 64-Bit Keys Generated     : 12,500,000,000
 Total In-Memory Dataset Size    : 100.00 GB
 Global Validation Status        : [PASSED]
 -------------------------------------------------------
-* PHASE 1: 64-Bit Integer Generation (In-HBM)
-  Execution Time               : 2.8303 seconds
-  HBM Generation Throughput    : 35.33 GB/s
-  ICI Network Traffic          : 0.00 GB
+PHASE 1: 64-Bit Integer Generation (In-HBM)
+  Execution Time                : 2.8303 seconds
+  HBM Generation Throughput     : 35.33 GB/s
+  ICI Network Traffic           : 0.00 GB
 -------------------------------------------------------
-* PHASE 2: ICI Exchange & Bucket Sorting
-  Execution Time               : 21.3385 seconds
-  ICI Network Traffic Routed   : 93.75 GB
-  Effective ICI Network Speed  : 4.39 GB/s
-  Effective Memory Bandwidth   : 28.12 GB/s
+PHASE 2: ICI Exchange & Bucket Sorting
+  Execution Time                : 21.3385 seconds
+  ICI Network Traffic Routed    : 93.75 GB
+  Effective ICI Network Speed   : 4.39 GB/s
+  Effective Memory Bandwidth    : 28.12 GB/s
 =======================================================
