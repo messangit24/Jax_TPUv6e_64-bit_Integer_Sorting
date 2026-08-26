@@ -37,8 +37,6 @@ The benchmark runs across three distinct phases:
 | **Interconnect** | Optical Circuit Interconnect (ICI) |
 | **Software Stack** | Python 3, JAX (`jaxlib` 0.5.2), XLA Compiler, GKE Kueue/Job Operator |
 
----
-
 ## Latest Benchmark Results (100 GB Scale Validation Run)
 
 =======================================================
