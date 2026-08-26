@@ -29,12 +29,10 @@ spec:
         cloud.google.com/gke-nodepool: mb-tpu-v6e-multi-16
       containers:
         - name: jax-tpu-container
-          # UPDATED BASE IMAGE HERE:
-          image: us-docker.pkg.dev/cloud-tpu-images/jax-stable-stack/tpu:jax0.5.2-rev1
+          image: europe-west4-docker.pkg.dev/mb-development-447000/openshmem-benchmarks/tpu-jax-sort:v1
           command: ["/bin/bash", "-c"]
           args:
             - |
-              mkdir -p /app
               cat << 'EOF' > /app/tpu_jax_sort.py
               import jax
               jax.config.update("jax_enable_x64", True)
@@ -50,7 +48,7 @@ spec:
               # DATASET SCALING PARAMETER
               # 50_000_000   -> 6.40 GB Total
               # 781_250_000  -> 100.00 GB Total (12.5 Billion Keys)
-              # 1_171_875_000 -> 150.00 GB Total (18.75 Billion Keys)
+              # 1_171_875_000  -> 150.00 GB Total (18.75 Billion Keys)
               # =============================================================
               ELEMENTS_PER_CHIP = 781_250_000
 
@@ -203,15 +201,15 @@ spec:
                       print(f"Global Validation Status        : {'[PASSED]' if validation_passed else '[FAILED]'}", flush=True)
                       print("-------------------------------------------------------", flush=True)
                       print("PHASE 1: 64-Bit Integer Generation (In-HBM)", flush=True)
-                      print(f"  Execution Time               : {t_gen:.4f} seconds", flush=True)
-                      print(f"  HBM Generation Throughput    : {gen_throughput_gbps:.2f} GB/s", flush=True)
-                      print(f"  ICI Network Traffic          : 0.00 GB", flush=True)
+                      print(f"  Execution Time                : {t_gen:.4f} seconds", flush=True)
+                      print(f"  HBM Generation Throughput     : {gen_throughput_gbps:.2f} GB/s", flush=True)
+                      print(f"  ICI Network Traffic           : 0.00 GB", flush=True)
                       print("-------------------------------------------------------", flush=True)
                       print("PHASE 2: ICI Exchange & Bucket Sorting", flush=True)
-                      print(f"  Execution Time               : {t_sort:.4f} seconds", flush=True)
-                      print(f"  ICI Network Traffic Routed   : {network_traffic_gb:.2f} GB", flush=True)
-                      print(f"  Effective ICI Network Speed  : {effective_network_gbps:.2f} GB/s", flush=True)
-                      print(f"  Effective Memory Bandwidth   : {effective_memory_bandwidth_gbps:.2f} GB/s", flush=True)
+                      print(f"  Execution Time                : {t_sort:.4f} seconds", flush=True)
+                      print(f"  ICI Network Traffic Routed    : {network_traffic_gb:.2f} GB", flush=True)
+                      print(f"  Effective ICI Network Speed   : {effective_network_gbps:.2f} GB/s", flush=True)
+                      print(f"  Effective Memory Bandwidth    : {effective_memory_bandwidth_gbps:.2f} GB/s", flush=True)
                       print("=======================================================\n", flush=True)
 
                   time.sleep(2)
