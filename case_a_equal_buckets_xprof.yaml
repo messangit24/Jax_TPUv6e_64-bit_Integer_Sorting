@@ -1,0 +1,364 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: jax-tpu-svc
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    job-name: jax-tpu-case-a
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: jax-tpu-case-a
+spec:
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        job-name: jax-tpu-case-a
+    spec:
+      subdomain: jax-tpu-svc
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: 2x4
+        cloud.google.com/gke-nodepool: mb-tpu-v6e-multi-8
+      containers:
+        - name: jax-tpu-container
+          image: us-docker.pkg.dev/cloud-tpu-images/jax-stable-stack/tpu:jax0.5.2-rev1
+          env:
+            - name: XLA_FLAGS
+              value: "--xla_dump_to=/tmp/xla_dump --xla_dump_hlo_as_text"
+          resources:
+            limits:
+              google.com/tpu: 4
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              mkdir -p /app /tmp/jax_cache /tmp/xprof /tmp/xla_dump
+
+              # Dynamically probe libtpu.so for supported telemetry & optimization flags
+              EXTRA_TPU_ARGS=""
+              for FLAG in "xla_jf_dump_llo_text" "xla_enable_custom_call_region_trace" "xla_xprof_enable_custom_call_tracing" "xla_xprof_register_llo_debug_info"; do
+                if python3 -c "import glob, libtpu, os, sys; so=glob.glob(os.path.dirname(libtpu.__file__)+'/*libtpu*.so')[0]; sys.exit(0 if b'$FLAG' in open(so,'rb').read() else 1)" 2>/dev/null; then
+                  EXTRA_TPU_ARGS="$EXTRA_TPU_ARGS --${FLAG}=true"
+                fi
+              done
+              EXTRA_TPU_ARGS="$(echo -n "$EXTRA_TPU_ARGS" | xargs)"
+              export LIBTPU_INIT_ARGS="$EXTRA_TPU_ARGS"
+              echo "Active LIBTPU_INIT_ARGS: $LIBTPU_INIT_ARGS"
+
+              cat << 'EOF' > /app/case_a_equal_buckets.py
+              import os
+              import re
+              import glob
+              import time
+              import math
+              import jax
+
+              jax.config.update("jax_enable_x64", True)
+              jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+
+              import jax.numpy as jnp
+              from jax.sharding import Mesh, PartitionSpec as P
+              from jax.experimental import shard_map
+              from jax.experimental import pallas as pl
+              from jax.experimental.pallas import tpu as pltpu
+
+              # =====================================================================
+              # CASE A: 2D TILED EQUAL-BUCKET CONFIGURATION (8 TPUv6e Chips)
+              #   TILES_PER_BUCKET = 1200 -> 10,066,329,600 Keys (80.53 GB Total)
+              # =====================================================================
+              NUM_CHIPS = 8
+              TILES_PER_BUCKET = 1200
+              TILE_ROWS = 128
+              TILE_COLS = 1024
+              KEYS_PER_TILE = TILE_ROWS * TILE_COLS  # 131,072 keys (1 MB/tile)
+              ELEMENTS_PER_CHIP = NUM_CHIPS * TILES_PER_BUCKET * KEYS_PER_TILE
+
+              CHIP_BITS = int(math.log2(NUM_CHIPS))                   # 3 bits
+              TILE_BITS = int(math.ceil(math.log2(TILES_PER_BUCKET))) # 10 bits
+              TPU_V6E_VMEM_BYTES = 128 * 1024 * 1024                  # 128 MiB per TensorCore
+              TPU_V6E_HBM_BW_GBS = 1640.0                             # 1,640 GB/s per chip
+
+              # ---------------------------------------------------------------------
+              # PHASE 1: Pallas 2D In-VMEM Key Generation (Equal Buckets)
+              # ---------------------------------------------------------------------
+              def pallas_keygen_2d_kernel(seed_vmem_ref, hi_out_vmem_ref, lo_out_vmem_ref):
+                  b_idx = pl.program_id(0)
+                  t_idx = pl.program_id(1)
+
+                  grid_offset = jnp.broadcast_to(
+                      jnp.uint32((b_idx << 16) | t_idx), (TILE_ROWS, TILE_COLS)
+                  )
+                  tile_seed = seed_vmem_ref[...] ^ grid_offset
+
+                  row_iota = jax.lax.broadcasted_iota(jnp.uint32, (TILE_ROWS, TILE_COLS), 0)
+                  col_iota = jax.lax.broadcasted_iota(jnp.uint32, (TILE_ROWS, TILE_COLS), 1)
+                  idx = (row_iota << jnp.uint32(10)) | col_iota
+
+                  # 12 VPU ALU/bitwise ops per key in VREGs ($v0..$v31)
+                  lo = idx ^ tile_seed
+                  lo = lo ^ (lo >> jnp.uint32(16))
+                  lo = lo * jnp.uint32(0x85ebca6b)
+                  lo = lo ^ (lo >> jnp.uint32(13))
+                  hi_rand = (lo * jnp.uint32(0xc2b2ae35)) ^ tile_seed
+
+                  total_prefix_bits = CHIP_BITS + TILE_BITS
+                  mask = (jnp.uint32(1) << jnp.uint32(32 - total_prefix_bits)) - jnp.uint32(1)
+                  prefix = (
+                      (jnp.uint32(b_idx) << jnp.uint32(32 - CHIP_BITS)) |
+                      (jnp.uint32(t_idx) << jnp.uint32(32 - total_prefix_bits))
+                  )
+                  mask_2d = jnp.broadcast_to(mask, (TILE_ROWS, TILE_COLS))
+                  prefix_2d = jnp.broadcast_to(prefix, (TILE_ROWS, TILE_COLS))
+
+                  hi_out_vmem_ref[...] = (hi_rand & mask_2d) | prefix_2d
+                  lo_out_vmem_ref[...] = lo
+
+              def generate_equal_buckets_2d(iter_seed: jax.Array):
+                  with jax.named_scope("Phase1_Pallas_2D_KeyGen"):
+                      dev_idx = jax.lax.axis_index('x')
+                      chip_seed = jnp.full(
+                          (TILE_ROWS, TILE_COLS),
+                          jnp.uint32(iter_seed) ^ (jnp.uint32(dev_idx + 1) * jnp.uint32(0x9e3779b9)),
+                          dtype=jnp.uint32,
+                      )
+                      out_shape = jax.ShapeDtypeStruct(
+                          (NUM_CHIPS, TILES_PER_BUCKET, TILE_ROWS, TILE_COLS), jnp.uint32
+                      )
+                      # Register explicit VPU op count & HBM bytes for XProf Roofline/Utilization Viewer
+                      vpu_ops_per_chip = ELEMENTS_PER_CHIP * 14
+                      bytes_per_chip = ELEMENTS_PER_CHIP * 8
+                      hi_2d, lo_2d = pl.pallas_call(
+                          pallas_keygen_2d_kernel,
+                          out_shape=(out_shape, out_shape),
+                          grid=(NUM_CHIPS, TILES_PER_BUCKET),
+                          in_specs=[pl.BlockSpec((TILE_ROWS, TILE_COLS), lambda b, t: (0, 0))],
+                          out_specs=[
+                              pl.BlockSpec((None, None, TILE_ROWS, TILE_COLS), lambda b, t: (b, t, 0, 0)),
+                              pl.BlockSpec((None, None, TILE_ROWS, TILE_COLS), lambda b, t: (b, t, 0, 0)),
+                          ],
+                          compiler_params=pltpu.TPUCompilerParams(
+                              dimension_semantics=("parallel", "parallel")
+                          ),
+                          cost_estimate=pl.CostEstimate(
+                              flops=vpu_ops_per_chip,
+                              transcendentals=0,
+                              bytes_accessed=bytes_per_chip,
+                          ),
+                          name="pallas_2d_equal_keygen",
+                      )(chip_seed)
+
+                      return (
+                          (hi_2d.astype(jnp.uint64) << jnp.uint64(32)) |
+                          lo_2d.astype(jnp.uint64)
+                      ).reshape(NUM_CHIPS, TILES_PER_BUCKET, KEYS_PER_TILE)
+
+              # ---------------------------------------------------------------------
+              # PHASE 2: Direct ICI All-to-All + 2D In-VMEM Tile Sort
+              # ---------------------------------------------------------------------
+              def exchange_and_sort_equal_2d(keys_2d):
+                  with jax.named_scope("Phase2A_ICI_AllToAll_DMA"):
+                      received = jax.lax.all_to_all(
+                          keys_2d, axis_name='x', split_axis=0, concat_axis=0
+                      )
+                  with jax.named_scope("Phase2B_2D_VMEM_Bitonic_Sort"):
+                      tiled_buckets = jnp.swapaxes(received, 0, 1).reshape(
+                          TILES_PER_BUCKET, NUM_CHIPS * KEYS_PER_TILE
+                      )
+                      return jnp.sort(tiled_buckets, axis=-1)
+
+              # ---------------------------------------------------------------------
+              # PHASE 3: Validation & Checksum
+              # ---------------------------------------------------------------------
+              def validate_equal_2d(sorted_2d):
+                  with jax.named_scope("Phase3_Global_Validation"):
+                      row_ok = jnp.all(sorted_2d[:, :-1] <= sorted_2d[:, 1:])
+                      tile_ok = jnp.all(sorted_2d[:-1, -1] <= sorted_2d[1:, 0])
+                      local_ok = row_ok & tile_ok
+
+                      chip_mins = jax.lax.all_gather(sorted_2d[0, 0], axis_name='x')
+                      chip_maxs = jax.lax.all_gather(sorted_2d[-1, -1], axis_name='x')
+                      boundary_ok = jnp.all(chip_maxs[:-1] <= chip_mins[1:])
+                      all_ok = jnp.all(jax.lax.all_gather(local_ok, axis_name='x')) & boundary_ok
+
+                      local_sum = jnp.sum(sorted_2d, dtype=jnp.uint64)
+                      global_sum = jnp.sum(jax.lax.all_gather(local_sum, axis_name='x'), dtype=jnp.uint64)
+                      return all_ok, global_sum
+
+              # ---------------------------------------------------------------------
+              # HARDWARE TELEMETRY & XPROF REPORT GENERATOR
+              # ---------------------------------------------------------------------
+              report_lines = []
+              def log_msg(s=""):
+                  print(s, flush=True)
+                  report_lines.append(str(s))
+
+              def print_hardware_telemetry_report(jit_gen, jit_sort, sample_seed, sample_keys, dev0):
+                  log_msg("\n" + "=" * 78)
+                  log_msg("   TPU v6e HARDWARE TELEMETRY: DMA, VMEM, VREG, VPU & MXU ANALYSIS")
+                  log_msg("=" * 78)
+
+                  # 1. Live Device HBM Memory Stats
+                  try:
+                      mem_stats = dev0.memory_stats() or {}
+                  except Exception:
+                      mem_stats = {}
+                  bytes_in_use = mem_stats.get("bytes_in_use", 0) / (1024**3)
+                  peak_bytes = mem_stats.get("peak_bytes_in_use", 0) / (1024**3)
+                  bytes_limit = mem_stats.get("bytes_limit", 32 * 1024**3) / (1024**3)
+                  log_msg(f"[HBM Live Usage (Chip 0)] In-Use: {bytes_in_use:.2f} GiB | Peak: {peak_bytes:.2f} GiB / {bytes_limit:.2f} GiB ({100*peak_bytes/max(bytes_limit,1):.1f}%)")
+
+                  # 2. Static Compiler Memory & Cost Analysis (VMEM / HBM Temp & Aliasing)
+                  try:
+                      for stage_name, fn, arg in [
+                          ("Phase 1 (Pallas 2D KeyGen)", jit_gen, sample_seed),
+                          ("Phase 2 (AllToAll + 2D VMEM Sort)", jit_sort, sample_keys),
+                      ]:
+                          compiled = fn.lower(arg).compile()
+                          ma = compiled.memory_analysis()
+                          ca = compiled.cost_analysis()
+                          log_msg(f"\n--- {stage_name} Compiler Analysis ---")
+                          if ma is not None:
+                              temp_mb = getattr(ma, "temp_size_in_bytes", 0) / (1024**2)
+                              arg_mb = getattr(ma, "argument_size_in_bytes", 0) / (1024**2)
+                              out_mb = getattr(ma, "output_size_in_bytes", 0) / (1024**2)
+                              host_temp_mb = getattr(ma, "host_temp_size_in_bytes", 0) / (1024**2)
+                              log_msg(f"  Buffer Footprint : Args={arg_mb:.2f} MiB | Output={out_mb:.2f} MiB | Temp={temp_mb:.2f} MiB | HostTemp={host_temp_mb:.2f} MiB")
+                          if ca is not None and isinstance(ca, dict):
+                              flops = ca.get("flops", 0.0)
+                              bytes_acc = ca.get("bytes accessed", 0.0)
+                              log_msg(f"  Cost Model Est.  : VPU Ops={flops:,.0f} | Bytes Accessed={bytes_acc/(1024**3):.2f} GiB")
+                  except Exception as e:
+                      log_msg(f"\n[Compiler Analysis Note]: {e}")
+
+                  # 3. Architectural VMEM Tile Footprint Check
+                  p1_vmem_tile_kb = (TILE_ROWS * TILE_COLS * 4 * 2 * 2) / 1024.0
+                  p2_vmem_row_mb = (NUM_CHIPS * KEYS_PER_TILE * 8) / (1024**2)
+                  vmem_total_mb = TPU_V6E_VMEM_BYTES / (1024**2)
+                  log_msg(f"\n[VMEM Scratchpad Footprint (128 MiB Total per TensorCore)]")
+                  log_msg(f"  Phase 1 Pallas Double-Buffered Tile : {p1_vmem_tile_kb:.1f} KiB ({100*p1_vmem_tile_kb/(vmem_total_mb*1024):.2f}% of VMEM)")
+                  log_msg(f"  Phase 2 2D Sort Row Working Set     : {p2_vmem_row_mb:.2f} MiB ({100*p2_vmem_row_mb/vmem_total_mb:.2f}% of VMEM -> Fits 100% in VMEM!)")
+
+                  # 4. Parse HLO & LLO Dumps for DMA, VPU, MXU, VREG ($v), and VMEM Spills
+                  hlo_files = glob.glob("/tmp/xla_dump/*after_optimizations*.txt") + glob.glob("/tmp/xla_dump/*.llo.txt")
+                  dma_ops, custom_calls, sort_ops, mxu_dots, vmem_spills = 0, 0, 0, 0, 0
+                  vregs_seen, sregs_seen = set(), set()
+                  for fpath in hlo_files:
+                      try:
+                          txt = open(fpath, "r", errors="ignore").read()
+                          dma_ops += len(re.findall(r"\b(all-to-all|copy-start|copy-done|ragged-all-to-all)\b", txt))
+                          custom_calls += len(re.findall(r"custom-call", txt))
+                          sort_ops += len(re.findall(r"\bsort\b", txt))
+                          mxu_dots += len(re.findall(r"\b(dot|convolution)\b", txt))
+                          vmem_spills += len(re.findall(r"(spill|VMem Spill)", txt, re.IGNORECASE))
+                          vregs_seen.update(re.findall(r"(?:\$v|%v)\d+", txt))
+                          sregs_seen.update(re.findall(r"(?:\$s|%s)\d+", txt))
+                      except Exception:
+                          pass
+                  log_msg(f"\n[HLO / LLO Instruction & Register Breakdown (/tmp/xla_dump)]")
+                  log_msg(f"  DMA / Collective Ops (all-to-all / copy-start/done) : {dma_ops}")
+                  log_msg(f"  Pallas Custom-Call Kernels Lowered                  : {custom_calls}")
+                  log_msg(f"  VPU Bitonic Sort / Compare Regions                  : {sort_ops}")
+                  log_msg(f"  MXU Matrix Multiply (dot/conv) Ops                  : {mxu_dots} (0% MXU -> 100% VPU + DMA workload!)")
+                  log_msg(f"  VMEM Spills to HBM Detected                         : {vmem_spills}")
+                  if vregs_seen or sregs_seen:
+                      log_msg(f"  LLO Registers Referenced                            : {len(vregs_seen)} VREGs ($v) | {len(sregs_seen)} SREGs ($s)")
+                  log_msg("=" * 78 + "\n")
+
+              def main():
+                  coordinator = "jax-tpu-case-a-0.jax-tpu-svc.default.svc.cluster.local:1234"
+                  process_id = int(os.environ.get("JOB_COMPLETION_INDEX", 0))
+                  num_processes = int(os.environ.get("JOB_COMPLETIONS", 2))
+
+                  if num_processes > 1:
+                      jax.distributed.initialize(
+                          coordinator_address=coordinator,
+                          num_processes=num_processes,
+                          process_id=process_id,
+                          initialization_timeout=1800,
+                      )
+
+                  devices = jax.devices()
+                  num_devices = len(devices)
+                  mesh = Mesh(devices, ('x',))
+
+                  jit_gen = jax.jit(shard_map.shard_map(
+                      generate_equal_buckets_2d, mesh=mesh, in_specs=P(), out_specs=P('x', None, None), check_rep=False
+                  ))
+                  jit_sort = jax.jit(shard_map.shard_map(
+                      exchange_and_sort_equal_2d, mesh=mesh, in_specs=P('x', None, None), out_specs=P('x', None), check_rep=False
+                  ))
+                  jit_val = jax.jit(shard_map.shard_map(
+                      validate_equal_2d, mesh=mesh, in_specs=P('x', None), out_specs=(P(), P()), check_rep=False
+                  ))
+
+                  total_keys = ELEMENTS_PER_CHIP * num_devices
+                  total_gb = (total_keys * 8) / 1e9
+                  ici_gb = total_gb * ((num_devices - 1) / num_devices)
+
+                  for i, seed in enumerate([111, 222, 333]):
+                      label = "COLD (incl. compile)" if i == 0 else f"WARM #{i} (steady-state)"
+
+                      trace_active = (i == 2)
+                      if trace_active:
+                          jax.profiler.start_trace("/tmp/xprof")
+
+                      with jax.profiler.StepTraceAnnotation("benchmark_step", step_num=i):
+                          t0 = time.perf_counter()
+                          keys_2d = jit_gen(jnp.uint32(seed))
+                          keys_2d.block_until_ready()
+                          t_gen = time.perf_counter() - t0
+
+                          t1 = time.perf_counter()
+                          sorted_2d = jit_sort(keys_2d)
+                          sorted_2d.block_until_ready()
+                          t_sort = time.perf_counter() - t1
+                          keys_2d = None  # Free input buffer immediately to keep peak memory minimal
+
+                          passed, g_sum = jit_val(sorted_2d)
+                          passed.block_until_ready()
+                          if i < 2:
+                              sorted_2d = None  # Free sorted buffer before next generation run
+
+                      if trace_active:
+                          jax.profiler.stop_trace()
+
+                      if process_id == 0:
+                          ns_per_item = (t_sort * 1e9) / total_keys
+                          gen_bw_per_chip = (total_gb / num_devices) / t_gen
+                          gen_hbm_util = 100.0 * gen_bw_per_chip / TPU_V6E_HBM_BW_GBS
+                          vpu_keygen_gops = (ELEMENTS_PER_CHIP * 14 / 1e9) / t_gen
+                          vpu_sort_gops = (TILES_PER_BUCKET * 1048576 * 210 / 1e9) / t_sort
+
+                          log_msg("=======================================================")
+                          log_msg(f"[CASE A: EQUAL BUCKETS] {label} (seed={seed})")
+                          log_msg(f"Total Active TPU Chips   : {num_devices}")
+                          log_msg(f"Total Keys Sorted        : {total_keys:,} ({total_gb:.2f} GB)")
+                          log_msg(f"Validation & Checksum    : [{'PASSED' if bool(passed) else 'FAILED'}] sum={int(g_sum)}")
+                          log_msg(f"Phase 1 (Pallas 2D Gen)  : {t_gen:.4f} s ({total_gb/t_gen:.2f} GB/s cluster | {gen_hbm_util:.1f}% HBM BW | VPU: {vpu_keygen_gops:.1f} GOPS/s/chip)")
+                          log_msg(f"Phase 2 (AllToAll+Sort)  : {t_sort:.4f} s (ICI DMA: {ici_gb/t_sort:.2f} GB/s | {ns_per_item:.4f} ns/key | VPU Sort: {vpu_sort_gops:.1f} GOPS/s/chip)")
+                          if trace_active:
+                              log_msg("XProf Trace Captured     : /tmp/xprof (Step 2 steady-state)")
+                          log_msg("=======================================================\n")
+
+                  if process_id == 0:
+                      sample_keys_shape = jax.ShapeDtypeStruct(
+                          (NUM_CHIPS, TILES_PER_BUCKET, KEYS_PER_TILE), jnp.uint64
+                      )
+                      print_hardware_telemetry_report(jit_gen, jit_sort, jnp.uint32(333), sample_keys_shape, jax.local_devices()[0])
+                      with open("/tmp/xprof_metrics_report.txt", "w") as f:
+                          f.write("\n".join(report_lines) + "\n")
+                      print("Report successfully saved to /tmp/xprof_metrics_report.txt", flush=True)
+                      print("Pod 0 holding /tmp/xprof and /tmp/xla_dump open for 600s so you can 'kubectl cp' them...", flush=True)
+                      time.sleep(600)
+
+              if __name__ == "__main__":
+                  main()
+              EOF
+              python3 /app/case_a_equal_buckets.py

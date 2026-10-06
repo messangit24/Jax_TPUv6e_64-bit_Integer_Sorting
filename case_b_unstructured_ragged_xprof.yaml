@@ -1,0 +1,358 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: jax-tpu-svc-b
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    job-name: jax-tpu-case-b
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: jax-tpu-case-b
+spec:
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        job-name: jax-tpu-case-b
+    spec:
+      subdomain: jax-tpu-svc-b
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: 2x4
+        cloud.google.com/gke-nodepool: mb-tpu-v6e-multi-8
+      containers:
+        - name: jax-tpu-container
+          image: us-docker.pkg.dev/cloud-tpu-images/jax-stable-stack/tpu:jax0.5.2-rev1
+          env:
+            - name: XLA_FLAGS
+              value: "--xla_dump_to=/tmp/xla_dump --xla_dump_hlo_as_text"
+          resources:
+            limits:
+              google.com/tpu: 4
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              mkdir -p /app /tmp/jax_cache /tmp/xprof /tmp/xla_dump
+
+              # Dynamically probe libtpu.so for supported telemetry & optimization flags
+              EXTRA_TPU_ARGS=""
+              for FLAG in "xla_jf_dump_llo_text" "xla_enable_custom_call_region_trace" "xla_xprof_enable_custom_call_tracing" "xla_xprof_register_llo_debug_info"; do
+                if python3 -c "import glob, libtpu, os, sys; so=glob.glob(os.path.dirname(libtpu.__file__)+'/*libtpu*.so')[0]; sys.exit(0 if b'$FLAG' in open(so,'rb').read() else 1)" 2>/dev/null; then
+                  EXTRA_TPU_ARGS="$EXTRA_TPU_ARGS --${FLAG}=true"
+                fi
+              done
+              EXTRA_TPU_ARGS="$(echo -n "$EXTRA_TPU_ARGS" | xargs)"
+              export LIBTPU_INIT_ARGS="$EXTRA_TPU_ARGS"
+              echo "Active LIBTPU_INIT_ARGS: $LIBTPU_INIT_ARGS"
+
+              cat << 'EOF' > /app/case_b_ragged_unstructured.py
+              import os
+              import re
+              import glob
+              import time
+              import math
+              import jax
+
+              jax.config.update("jax_enable_x64", True)
+              jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+
+              import jax.numpy as jnp
+              from jax.sharding import Mesh, PartitionSpec as P
+              from jax.experimental import shard_map
+              from jax.experimental import pallas as pl
+              from jax.experimental.pallas import tpu as pltpu
+
+              # =====================================================================
+              # CASE B: PURE UNSTRUCTURED RANDOM KEYS (VARIABLE BUCKET SIZES)
+              # =====================================================================
+              NUM_CHIPS = 8
+              CHIP_BITS = int(math.log2(NUM_CHIPS))
+
+              BLOCK_WIDTH = 128
+              TILE_BLOCKS = 1024
+              NUM_TILES_PER_CHIP = 512
+              NUM_BLOCKS_PER_CHIP = NUM_TILES_PER_CHIP * TILE_BLOCKS
+              ELEMENTS_PER_CHIP = NUM_BLOCKS_PER_CHIP * BLOCK_WIDTH
+
+              RECV_BUFFER_BLOCKS = int(NUM_BLOCKS_PER_CHIP * 1.05)
+              UINT64_MAX = jnp.uint64(0xFFFFFFFFFFFFFFFF)
+              TPU_V6E_VMEM_BYTES = 128 * 1024 * 1024
+              TPU_V6E_HBM_BW_GBS = 1640.0
+
+              # ---------------------------------------------------------------------
+              # PHASE 1: Pallas 2D Unstructured Random Key Generation
+              # ---------------------------------------------------------------------
+              def pallas_unstructured_keygen_kernel(seed_vmem_ref, hi_out_vmem_ref, lo_out_vmem_ref):
+                  t_idx = pl.program_id(0)
+                  grid_offset = jnp.broadcast_to(
+                      jnp.uint32(t_idx + 1) * jnp.uint32(0x9e3779b9), (TILE_BLOCKS, BLOCK_WIDTH)
+                  )
+                  tile_seed = seed_vmem_ref[...] ^ grid_offset
+
+                  row_iota = jax.lax.broadcasted_iota(jnp.uint32, (TILE_BLOCKS, BLOCK_WIDTH), 0)
+                  col_iota = jax.lax.broadcasted_iota(jnp.uint32, (TILE_BLOCKS, BLOCK_WIDTH), 1)
+                  idx = (row_iota << jnp.uint32(7)) | col_iota
+
+                  lo = idx ^ tile_seed
+                  lo = (lo ^ (lo >> jnp.uint32(16))) * jnp.uint32(0x85ebca6b)
+                  lo = (lo ^ (lo >> jnp.uint32(13))) * jnp.uint32(0xc2b2ae35)
+                  lo = lo ^ (lo >> jnp.uint32(16))
+
+                  block_hash = ((row_iota + jnp.uint32(t_idx * TILE_BLOCKS)) ^ tile_seed) * jnp.uint32(0x85ebca6b)
+                  block_hash = (block_hash ^ (block_hash >> jnp.uint32(16))) * jnp.uint32(0xc2b2ae35)
+                  hi_bucket_bits = block_hash & jnp.uint32(0xE0000000)
+                  hi_lower_bits = ((lo * jnp.uint32(0x1b873593)) ^ tile_seed) & jnp.uint32(0x1FFFFFFF)
+
+                  hi_out_vmem_ref[...] = hi_bucket_bits | hi_lower_bits
+                  lo_out_vmem_ref[...] = lo
+
+              def generate_unstructured_2d(iter_seed: jax.Array):
+                  with jax.named_scope("Phase1_Pallas_Unstructured_KeyGen"):
+                      dev_idx = jax.lax.axis_index('x')
+                      chip_seed = jnp.full(
+                          (TILE_BLOCKS, BLOCK_WIDTH),
+                          jnp.uint32(iter_seed) ^ (jnp.uint32(dev_idx + 1) * jnp.uint32(0x7f4a7c15)),
+                          dtype=jnp.uint32,
+                      )
+                      out_shape = jax.ShapeDtypeStruct(
+                          (NUM_TILES_PER_CHIP, TILE_BLOCKS, BLOCK_WIDTH), jnp.uint32
+                      )
+                      hi_2d, lo_2d = pl.pallas_call(
+                          pallas_unstructured_keygen_kernel,
+                          out_shape=(out_shape, out_shape),
+                          grid=(NUM_TILES_PER_CHIP,),
+                          in_specs=[pl.BlockSpec((TILE_BLOCKS, BLOCK_WIDTH), lambda t: (0, 0))],
+                          out_specs=[
+                              pl.BlockSpec((None, TILE_BLOCKS, BLOCK_WIDTH), lambda t: (t, 0, 0)),
+                              pl.BlockSpec((None, TILE_BLOCKS, BLOCK_WIDTH), lambda t: (t, 0, 0)),
+                          ],
+                          compiler_params=pltpu.TPUCompilerParams(
+                              dimension_semantics=("parallel",)
+                          ),
+                          cost_estimate=pl.CostEstimate(
+                              flops=ELEMENTS_PER_CHIP * 18,
+                              transcendentals=0,
+                              bytes_accessed=ELEMENTS_PER_CHIP * 8,
+                          ),
+                          name="pallas_unstructured_keygen",
+                      )(chip_seed)
+
+                      return (
+                          (hi_2d.astype(jnp.uint64) << jnp.uint64(32)) |
+                          lo_2d.astype(jnp.uint64)
+                      ).reshape(NUM_BLOCKS_PER_CHIP, BLOCK_WIDTH)
+
+              # ---------------------------------------------------------------------
+              # PHASE 2: Dynamic Bucket Counting + Ragged All-to-All + Local Sort
+              # ---------------------------------------------------------------------
+              def ragged_exchange_and_sort(keys_blocks):
+                  with jax.named_scope("Phase2A_Dynamic_Bucket_Histogram"):
+                      block_bucket_ids = (keys_blocks[:, 0] >> jnp.uint64(64 - CHIP_BITS)).astype(jnp.int32)
+                      send_sizes = jnp.bincount(block_bucket_ids, length=NUM_CHIPS).astype(jnp.int32)
+                      input_offsets = (jnp.cumsum(send_sizes) - send_sizes).astype(jnp.int32)
+
+                      bucket_perm = jnp.argsort(block_bucket_ids)
+                      packed_operand = keys_blocks[bucket_perm]
+
+                      recv_sizes = jax.lax.all_to_all(
+                          send_sizes, axis_name='x', split_axis=0, concat_axis=0
+                      )
+                      local_recv_offsets = (jnp.cumsum(recv_sizes) - recv_sizes).astype(jnp.int32)
+                      output_offsets = jax.lax.all_to_all(
+                          local_recv_offsets, axis_name='x', split_axis=0, concat_axis=0
+                      )
+
+                  with jax.named_scope("Phase2B_ICI_Ragged_AllToAll_DMA"):
+                      recv_buffer = jnp.full(
+                          (RECV_BUFFER_BLOCKS, BLOCK_WIDTH), UINT64_MAX, dtype=jnp.uint64
+                      )
+                      received_blocks = jax.lax.ragged_all_to_all(
+                          operand=packed_operand,
+                          output=recv_buffer,
+                          input_offsets=input_offsets,
+                          send_sizes=send_sizes,
+                          output_offsets=output_offsets,
+                          recv_sizes=recv_sizes,
+                          axis_name='x',
+                      )
+
+                  with jax.named_scope("Phase2C_Local_VPU_Sort"):
+                      flat_received = received_blocks.reshape(-1)
+                      sorted_local = jnp.sort(flat_received)
+                      total_valid_keys = jnp.sum(recv_sizes, dtype=jnp.int64) * BLOCK_WIDTH
+
+                  return sorted_local, send_sizes * BLOCK_WIDTH, recv_sizes * BLOCK_WIDTH, total_valid_keys
+
+              # ---------------------------------------------------------------------
+              # PHASE 3: Conservation & Global Order Validation
+              # ---------------------------------------------------------------------
+              def validate_ragged(sorted_local, total_valid_keys):
+                  with jax.named_scope("Phase3_Global_Ragged_Validation"):
+                      local_ok = jnp.all(sorted_local[:-1] <= sorted_local[1:])
+                      my_min = sorted_local[0]
+                      my_max = sorted_local[total_valid_keys - 1]
+
+                      chip_mins = jax.lax.all_gather(my_min, axis_name='x')
+                      chip_maxs = jax.lax.all_gather(my_max, axis_name='x')
+                      boundary_ok = jnp.all(chip_maxs[:-1] <= chip_mins[1:])
+
+                      global_valid_keys = jnp.sum(jax.lax.all_gather(total_valid_keys, axis_name='x'))
+                      conservation_ok = (global_valid_keys == (ELEMENTS_PER_CHIP * NUM_CHIPS))
+
+                      idx = jnp.arange(sorted_local.shape[0], dtype=jnp.int64)
+                      valid_mask = idx < total_valid_keys
+                      local_sum = jnp.sum(jnp.where(valid_mask, sorted_local, jnp.uint64(0)), dtype=jnp.uint64)
+                      global_sum = jnp.sum(jax.lax.all_gather(local_sum, axis_name='x'), dtype=jnp.uint64)
+
+                      all_ok = jnp.all(jax.lax.all_gather(local_ok, axis_name='x')) & boundary_ok & conservation_ok
+                      return all_ok, global_sum, global_valid_keys
+
+              def print_hardware_telemetry_report(jit_gen, jit_ragged_sort, sample_seed, sample_blocks, dev0):
+                  print("\n" + "=" * 78, flush=True)
+                  print("   TPU v6e HARDWARE TELEMETRY: RAGGED DMA, VMEM, VREG, VPU & MXU ANALYSIS", flush=True)
+                  print("=" * 78, flush=True)
+
+                  # 1. Live Device HBM Memory Stats
+                  try:
+                      mem_stats = dev0.memory_stats() or {}
+                  except Exception:
+                      mem_stats = {}
+                  bytes_in_use = mem_stats.get("bytes_in_use", 0) / (1024**3)
+                  peak_bytes = mem_stats.get("peak_bytes_in_use", 0) / (1024**3)
+                  bytes_limit = mem_stats.get("bytes_limit", 16 * 1024**3) / (1024**3)
+                  print(f"[HBM Live Usage (Chip 0)] In-Use: {bytes_in_use:.2f} GiB | Peak: {peak_bytes:.2f} GiB / {bytes_limit:.2f} GiB ({100*peak_bytes/max(bytes_limit,1):.1f}%)", flush=True)
+
+                  try:
+                      for stage_name, fn, arg in [
+                          ("Phase 1 (Pallas Unstructured KeyGen)", jit_gen, sample_seed),
+                          ("Phase 2 (Ragged AllToAll + Sort)", jit_ragged_sort, sample_blocks),
+                      ]:
+                          compiled = fn.lower(arg).compile()
+                          ma = compiled.memory_analysis()
+                          ca = compiled.cost_analysis()
+                          print(f"\n--- {stage_name} Compiler Analysis ---", flush=True)
+                          if ma is not None:
+                              temp_mb = getattr(ma, "temp_size_in_bytes", 0) / (1024**2)
+                              arg_mb = getattr(ma, "argument_size_in_bytes", 0) / (1024**2)
+                              out_mb = getattr(ma, "output_size_in_bytes", 0) / (1024**2)
+                              print(f"  Buffer Footprint : Args={arg_mb:.2f} MiB | Output={out_mb:.2f} MiB | Temp={temp_mb:.2f} MiB", flush=True)
+                          if ca is not None and isinstance(ca, dict):
+                              flops = ca.get("flops", 0.0)
+                              bytes_acc = ca.get("bytes accessed", 0.0)
+                              print(f"  Cost Model Est.  : VPU Ops={flops:,.0f} | Bytes Accessed={bytes_acc/(1024**3):.2f} GiB", flush=True)
+                  except Exception as e:
+                      print(f"\n[Compiler Analysis Note]: {e}", flush=True)
+
+                  hlo_files = glob.glob("/tmp/xla_dump/*after_optimizations*.txt") + glob.glob("/tmp/xla_dump/*.llo.txt")
+                  ragged_dmas, a2a_ops, custom_calls, sort_ops, mxu_dots = 0, 0, 0, 0, 0
+                  vregs_seen, sregs_seen = set(), set()
+                  for fpath in hlo_files:
+                      try:
+                          txt = open(fpath, "r", errors="ignore").read()
+                          ragged_dmas += len(re.findall(r"ragged-all-to-all", txt))
+                          a2a_ops += len(re.findall(r"\b(all-to-all|copy-start|copy-done)\b", txt))
+                          custom_calls += len(re.findall(r"custom-call", txt))
+                          sort_ops += len(re.findall(r"\bsort\b", txt))
+                          mxu_dots += len(re.findall(r"\b(dot|convolution)\b", txt))
+                          vregs_seen.update(re.findall(r"(?:\$v|%v)\d+", txt))
+                          sregs_seen.update(re.findall(r"(?:\$s|%s)\d+", txt))
+                      except Exception:
+                          pass
+                  print(f"\n[HLO / LLO Instruction & Register Breakdown (/tmp/xla_dump)]", flush=True)
+                  print(f"  Ragged-All-To-All Variable RDMA Ops : {ragged_dmas}", flush=True)
+                  print(f"  Standard DMA / Collective Ops       : {a2a_ops}", flush=True)
+                  print(f"  Pallas Custom-Call Kernels Lowered  : {custom_calls}", flush=True)
+                  print(f"  VPU Sort / Radix Permute Regions    : {sort_ops}", flush=True)
+                  print(f"  MXU Matrix Multiply (dot/conv) Ops  : {mxu_dots} (0% MXU -> 100% VPU + DMA workload!)", flush=True)
+                  if vregs_seen or sregs_seen:
+                      print(f"  LLO Registers Referenced            : {len(vregs_seen)} VREGs ($v) | {len(sregs_seen)} SREGs ($s)", flush=True)
+                  print("=" * 78 + "\n", flush=True)
+
+              def main():
+                  coordinator = "jax-tpu-case-b-0.jax-tpu-svc-b.default.svc.cluster.local:1234"
+                  process_id = int(os.environ.get("JOB_COMPLETION_INDEX", 0))
+                  num_processes = int(os.environ.get("JOB_COMPLETIONS", 2))
+
+                  if num_processes > 1:
+                      jax.distributed.initialize(
+                          coordinator_address=coordinator,
+                          num_processes=num_processes,
+                          process_id=process_id,
+                          initialization_timeout=1800,
+                      )
+
+                  devices = jax.devices()
+                  num_devices = len(devices)
+                  mesh = Mesh(devices, ('x',))
+
+                  jit_gen = jax.jit(shard_map.shard_map(
+                      generate_unstructured_2d, mesh=mesh, in_specs=P(), out_specs=P('x', None), check_rep=False
+                  ))
+                  jit_ragged_sort = jax.jit(shard_map.shard_map(
+                      ragged_exchange_and_sort,
+                      mesh=mesh,
+                      in_specs=P('x', None),
+                      out_specs=(P('x'), P('x'), P('x'), P('x')),
+                      check_rep=False,
+                  ))
+                  jit_val = jax.jit(shard_map.shard_map(
+                      validate_ragged, mesh=mesh, in_specs=(P('x'), P('x')), out_specs=(P(), P(), P()), check_rep=False
+                  ))
+
+                  total_keys = ELEMENTS_PER_CHIP * num_devices
+                  total_gb = (total_keys * 8) / 1e9
+                  ici_gb = total_gb * ((num_devices - 1) / num_devices)
+
+                  for i, seed in enumerate([111, 222, 333]):
+                      label = "COLD (incl. compile)" if i == 0 else f"WARM #{i} (steady-state)"
+                      trace_active = (i == 2)
+                      if trace_active:
+                          jax.profiler.start_trace("/tmp/xprof")
+
+                      with jax.profiler.StepTraceAnnotation("ragged_benchmark_step", step_num=i):
+                          t0 = time.perf_counter()
+                          raw_blocks = jit_gen(jnp.uint32(seed))
+                          raw_blocks.block_until_ready()
+                          t_gen = time.perf_counter() - t0
+
+                          t1 = time.perf_counter()
+                          sorted_keys, sent_counts, recv_counts, valid_cnt = jit_ragged_sort(raw_blocks)
+                          sorted_keys.block_until_ready()
+                          t_sort = time.perf_counter() - t1
+
+                          passed, g_sum, g_count = jit_val(sorted_keys, valid_cnt)
+                          passed.block_until_ready()
+
+                      if trace_active:
+                          jax.profiler.stop_trace()
+
+                      if process_id == 0:
+                          ns_per_item = (t_sort * 1e9) / total_keys
+                          chip0_send = [int(x) for x in sent_counts[:num_devices]]
+                          print("=======================================================", flush=True)
+                          print(f"[CASE B: RAGGED VARIABLE BUCKETS] {label} (seed={seed})", flush=True)
+                          print(f"Total Keys Generated/Conserved : {int(g_count):,} / {total_keys:,} ({total_gb:.2f} GB)", flush=True)
+                          print(f"Chip 0 Variable Bucket Sizes   : {chip0_send}", flush=True)
+                          print(f"Global Validation & Checksum   : [{'PASSED' if bool(passed) else 'FAILED'}] sum={int(g_sum)}", flush=True)
+                          print(f"Phase 1 (Pallas Unstructured)  : {t_gen:.4f} s ({total_gb/t_gen:.2f} GB/s)", flush=True)
+                          print(f"Phase 2 (RaggedA2A + Sort)     : {t_sort:.4f} s (ICI DMA: {ici_gb/t_sort:.2f} GB/s | {ns_per_item:.4f} ns/key)", flush=True)
+                          if trace_active:
+                              print("XProf Trace Captured           : /tmp/xprof (Step 2 steady-state)", flush=True)
+                          print("=======================================================\n", flush=True)
+
+                  if process_id == 0:
+                      print_hardware_telemetry_report(jit_gen, jit_ragged_sort, jnp.uint32(333), raw_blocks, jax.local_devices()[0])
+                      print("Pod 0 holding /tmp/xprof and /tmp/xla_dump open for 600s so you can 'kubectl cp' them...", flush=True)
+                      time.sleep(600)
+
+              if __name__ == "__main__":
+                  main()
+              EOF
+              python3 /app/case_b_ragged_unstructured.py
