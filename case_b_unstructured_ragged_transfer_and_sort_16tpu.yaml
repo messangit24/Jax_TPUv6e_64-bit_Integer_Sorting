@@ -69,18 +69,18 @@ spec:
               from jax.experimental.pallas import tpu as pltpu
 
               # =====================================================================
-              # CASE B PIPELINED (16 TPUv6e Chips, 4x4 Topology): 103.08 GB SCALE
-              #   Double Data Size: 12,884,901,888 uint64 keys (103.08 GB Total)
+              # CASE B PIPELINED (16 TPUv6e Chips, 4x4 Topology): 150.32 GB SCALE
+              #   Scaled Data Size: 18,790,481,920 uint64 keys (150.32 GB Total)
               #   NUM_CHIPS = 16, CHIP_BITS = 4
-              #   Scaled Problem Size (Rec 2): NUM_TILES_PER_CHIP = 6144, NUM_CHUNKS = 12
+              #   Scaled Problem Size (Rec 2): NUM_TILES_PER_CHIP = 8960, NUM_CHUNKS = 16
               #   Strict 1,024-Byte (8-Flit) DMA Alignment (Rec 5)
               #   Dynamic Histogram Optimization (Rec 4)
               # =====================================================================
               NUM_CHIPS = 16
               CHIP_BITS = int(math.log2(NUM_CHIPS))  # 4 bits
 
-              NUM_TILES_PER_CHIP = 6144
-              NUM_CHUNKS = 12
+              NUM_TILES_PER_CHIP = 6656
+              NUM_CHUNKS = 13
               TILES_PER_CHUNK = NUM_TILES_PER_CHIP // NUM_CHUNKS  # 512 tiles per chunk
               TILE_BLOCKS = 1024
               BLOCK_WIDTH = 128                                    # 128 uint64 = 1,024 Bytes = 8 Flits
@@ -89,8 +89,8 @@ spec:
               KEYS_PER_CHUNK = BLOCKS_PER_CHUNK * BLOCK_WIDTH       # 67,108,864 keys
               RECV_BUFFER_BLOCKS_PER_CHUNK = int(BLOCKS_PER_CHUNK * 1.15)  # 602,931 blocks (15% safety margin)
 
-              NUM_BLOCKS_PER_CHIP = NUM_TILES_PER_CHIP * TILE_BLOCKS  # 6,291,456 blocks
-              ELEMENTS_PER_CHIP = NUM_BLOCKS_PER_CHIP * BLOCK_WIDTH    # 805,306,368 keys (6.44 GB)
+              NUM_BLOCKS_PER_CHIP = NUM_TILES_PER_CHIP * TILE_BLOCKS  # 6,815,744 blocks
+              ELEMENTS_PER_CHIP = NUM_BLOCKS_PER_CHIP * BLOCK_WIDTH    # 872,415,232 keys (6.98 GB / 6.50 GiB)
 
               UINT64_MAX = 0xFFFFFFFFFFFFFFFF
               TPU_V6E_VMEM_BYTES = 128 * 1024 * 1024
@@ -243,8 +243,12 @@ spec:
               # ---------------------------------------------------------------------
               def validate_ragged_pipelined(sorted_local, total_valid_keys, send_sizes_2d):
                   with jax.named_scope("Phase3_Validation"):
-                      local_ok = jnp.all(sorted_local[:-1] <= sorted_local[1:])
                       valid_cnt = total_valid_keys[0]
+                      idx = jnp.arange(sorted_local.shape[0] - 1, dtype=jnp.int64)
+                      valid_pair_mask = idx < (valid_cnt - 1)
+                      pair_ok = sorted_local[:-1] <= sorted_local[1:]
+                      local_ok = jnp.all(jnp.where(valid_pair_mask, pair_ok, True))
+
                       my_min = sorted_local[0]
                       my_max = sorted_local[valid_cnt - 1]
 
@@ -255,15 +259,16 @@ spec:
                       global_valid_keys = jnp.sum(jax.lax.all_gather(valid_cnt, axis_name='x'))
                       conservation_ok = (global_valid_keys == (ELEMENTS_PER_CHIP * NUM_CHIPS))
 
-                      idx = jnp.arange(sorted_local.shape[0], dtype=jnp.int64)
-                      valid_mask = idx < valid_cnt
+                      idx_full = jnp.arange(sorted_local.shape[0], dtype=jnp.int64)
+                      valid_mask = idx_full < valid_cnt
                       local_sum = jnp.sum(jnp.where(valid_mask, sorted_local, jnp.uint64(0)), dtype=jnp.uint64)
                       global_sum = jnp.sum(jax.lax.all_gather(local_sum, axis_name='x'), dtype=jnp.uint64)
 
-                      all_ok = jnp.all(jax.lax.all_gather(local_ok, axis_name='x')) & boundary_ok & conservation_ok
+                      all_local_ok = jnp.all(jax.lax.all_gather(local_ok, axis_name='x'))
+                      all_ok = all_local_ok & boundary_ok & conservation_ok
                       all_send_sizes = jax.lax.all_gather(send_sizes_2d, axis_name='x')
                       chip0_sizes = all_send_sizes[0, 0]
-                      return all_ok, global_sum, global_valid_keys, chip0_sizes
+                      return all_ok, global_sum, global_valid_keys, chip0_sizes, all_local_ok, boundary_ok, conservation_ok, chip_mins, chip_maxs
 
               def print_hardware_telemetry_report(jit_pipe, sample_seed, dev0):
                   print("\n" + "=" * 78, flush=True)
@@ -378,7 +383,7 @@ spec:
                       validate_ragged_pipelined,
                       mesh=mesh,
                       in_specs=(P('x'), P('x'), P('x', None)),
-                      out_specs=(P(), P(), P(), P()),
+                      out_specs=(P(), P(), P(), P(), P(), P(), P(), P(), P()),
                       check_rep=False,
                   ))
 
@@ -398,7 +403,7 @@ spec:
                       sorted_local.block_until_ready()
                       t_e2e = time.perf_counter() - t0
 
-                      passed, g_sum, g_count, chip0_send = jit_val(sorted_local, valid_cnt, sent_counts)
+                      passed, g_sum, g_count, chip0_send, l_ok, b_ok, c_ok, c_mins, c_maxs = jit_val(sorted_local, valid_cnt, sent_counts)
                       passed.block_until_ready()
                       if i < 2:
                           sorted_local = None
@@ -410,10 +415,14 @@ spec:
                           ns_per_item = (t_e2e * 1e9) / total_keys
                           chip0_send_list = [int(x) for x in chip0_send.tolist()]
                           print("=======================================================", flush=True)
-                          print(f"[CASE B PIPELINED OPTIMIZED: 16 TPUv6e / 103.08 GB] {label} (seed={seed})", flush=True)
+                          print(f"[CASE B PIPELINED OPTIMIZED: 16 TPUv6e / {total_gb:.2f} GB] {label} (seed={seed})", flush=True)
                           print(f"Total Keys Generated/Conserved : {int(g_count):,} / {total_keys:,} ({total_gb:.2f} GB)", flush=True)
                           print(f"Chip 0 Variable Bucket Sizes   : {chip0_send_list}", flush=True)
                           print(f"Global Validation & Checksum   : [{'PASSED' if bool(passed) else 'FAILED'}] sum={int(g_sum)}", flush=True)
+                          print(f"Validation Sub-Checks          : local_monotonic={bool(l_ok)}, global_boundary={bool(b_ok)}, conservation={bool(c_ok)}", flush=True)
+                          if not bool(b_ok):
+                              print(f"Chip Mins (hex)                : {[hex(int(x)) for x in c_mins.tolist()]}", flush=True)
+                              print(f"Chip Maxs (hex)                : {[hex(int(x)) for x in c_maxs.tolist()]}", flush=True)
                           print(f"Pipelined Transfer-and-Sort    : {t_e2e:.4f} s (Total: {total_gb/t_e2e:.2f} GB/s | ICI DMA: {ici_gb/t_e2e:.2f} GB/s | {ns_per_item:.4f} ns/key)", flush=True)
                           print("=======================================================\n", flush=True)
 

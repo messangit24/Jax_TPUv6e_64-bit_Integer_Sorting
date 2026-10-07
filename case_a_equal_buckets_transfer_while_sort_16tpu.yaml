@@ -69,27 +69,27 @@ spec:
               from jax.experimental.pallas import tpu as pltpu
 
               # =====================================================================
-              # CASE A PIPELINED (16 TPUv6e Chips, 4x4 Topology): 128.85 GB DATASET
-              #   Double Data Size: 16,106,127,360 uint64 keys (128.85 GB total)
-              #   NUM_CHIPS = 16, TILES_PER_BUCKET = 480, KEYS_PER_TILE = 131,072
+              # CASE A PIPELINED (16 TPUv6e Chips, 4x4 Topology): 161.06 GB DATASET
+              #   Scaled Data Size: 20,132,659,200 uint64 keys (161.06 GB total)
+              #   NUM_CHIPS = 16, TILES_PER_BUCKET = 600, KEYS_PER_TILE = 131,072
               #   3-Way Pipeline: KeyGen || ICI All-to-All DMA || In-VMEM Bitonic Sort
-              #   Tapered Schedule: Stage 0 = 30 tiles (503 MB warmup), Stages 1..3 = 150 tiles (2.51 GB)
+              #   Tapered Schedule: Stage 0 = 40 tiles (671 MB warmup), Stages 1..4 = 140 tiles (2.35 GB)
               #   In-VMEM Bitonic Sort: 16.78 MiB rows along axis=-1 in 128 MiB VMEM
               # =====================================================================
               NUM_CHIPS = 16
-              TILES_PER_BUCKET = 480
+              TILES_PER_BUCKET = 600
               TILE_ROWS = 128
               TILE_COLS = 1024
               KEYS_PER_TILE = TILE_ROWS * TILE_COLS  # 131,072 keys (1 MB/tile)
-              ELEMENTS_PER_CHIP = NUM_CHIPS * TILES_PER_BUCKET * KEYS_PER_TILE  # 1,006,632,960 keys (8.05 GB)
+              ELEMENTS_PER_CHIP = NUM_CHIPS * TILES_PER_BUCKET * KEYS_PER_TILE  # 1,258,291,200 keys (10.07 GB)
 
               CHIP_BITS = int(math.log2(NUM_CHIPS))                   # 4 bits
-              TILE_BITS = int(math.ceil(math.log2(TILES_PER_BUCKET))) # 9 bits
+              TILE_BITS = int(math.ceil(math.log2(TILES_PER_BUCKET))) # 10 bits
               TPU_V6E_VMEM_BYTES = 128 * 1024 * 1024                  # 128 MiB per core
               TPU_V6E_HBM_BW_GBS = 1640.0                             # 1,640 GB/s per chip
 
-              # 4-stage tapered pipeline schedule
-              CHUNK_SIZES = [30, 150, 150, 150]
+              # 5-stage tapered pipeline schedule
+              CHUNK_SIZES = [40, 140, 140, 140, 140]
               assert sum(CHUNK_SIZES) == TILES_PER_BUCKET, f"Sum of chunks {sum(CHUNK_SIZES)} != {TILES_PER_BUCKET}"
               CHUNK_OFFSETS = [0]
               for sz in CHUNK_SIZES[:-1]:
@@ -372,7 +372,7 @@ spec:
                       if process_id == 0:
                           ns_per_item = (t_pipe * 1e9) / total_keys
                           print("=======================================================", flush=True)
-                          print(f"[CASE A PIPELINED OPTIMIZED: 16 TPUv6e / 128.85 GB] {label} (seed={seed})", flush=True)
+                          print(f"[CASE A PIPELINED OPTIMIZED: 16 TPUv6e / 161.06 GB] {label} (seed={seed})", flush=True)
                           print(f"Total Keys Generated/Conserved : {total_keys:,} ({total_gb:.2f} GB)", flush=True)
                           print(f"Global Validation & Checksum   : [{'PASSED' if bool(passed) else 'FAILED'}] sum={int(g_sum)}", flush=True)
                           print(f"Pipelined Transfer-While-Sort  : {t_pipe:.4f} s (Total: {total_gb/t_pipe:.2f} GB/s | ICI DMA: {ici_gb/t_pipe:.2f} GB/s | {ns_per_item:.4f} ns/key)", flush=True)

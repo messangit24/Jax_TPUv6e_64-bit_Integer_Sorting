@@ -69,8 +69,8 @@ spec:
               from jax.experimental.pallas import tpu as pltpu
 
               # =====================================================================
-              # CASE B OPTIMIZED (16 TPUv6e Chips, 4x4 Topology): 68.72 GB DATASET
-              #   Double Data Size: 8,589,934,592 uint64 keys (68.72 GB total)
+              # CASE B OPTIMIZED (16 TPUv6e Chips, 4x4 Topology): 100.66 GB DATASET
+              #   Scaled Data Size: 12,582,912,000 uint64 keys (100.66 GB total)
               #   NUM_CHIPS = 16, CHIP_BITS = 4
               #   Rec 4: Dynamic Histogram Optimization & Direct Block Binning
               #   Rec 5: Strict 1,024-Byte (8-Flit) Hardware DMA Alignment
@@ -80,11 +80,11 @@ spec:
 
               BLOCK_WIDTH = 128             # 128 uint64 keys = 1,024 Bytes = EXACTLY 8 FLITS
               TILE_BLOCKS = 1024            # 1,024 blocks = 1.0 MiB
-              NUM_TILES_PER_CHIP = 4096
+              NUM_TILES_PER_CHIP = 6000
               NUM_BLOCKS_PER_CHIP = NUM_TILES_PER_CHIP * TILE_BLOCKS
-              ELEMENTS_PER_CHIP = NUM_BLOCKS_PER_CHIP * BLOCK_WIDTH  # 536,870,912 keys (4.29 GB/chip)
+              ELEMENTS_PER_CHIP = NUM_BLOCKS_PER_CHIP * BLOCK_WIDTH  # 786,432,000 keys (6.29 GB/chip)
 
-              NUM_PASSES = 8                # 512 MiB per pass (strictly <= 2 GiB signed DMA limit)
+              NUM_PASSES = 12               # 500 MiB per pass (strictly <= 2 GiB signed DMA limit)
               BLOCKS_PER_PASS = NUM_BLOCKS_PER_CHIP // NUM_PASSES
               RECV_BLOCKS_PER_PASS = int(BLOCKS_PER_PASS * 1.15)
               UINT64_MAX = 0xFFFFFFFFFFFFFFFF
@@ -392,7 +392,7 @@ spec:
                           ns_per_item = (t_sort * 1e9) / total_keys
                           chip0_send_list = [int(x) for x in chip0_send.tolist()]
                           print("=======================================================", flush=True)
-                          print(f"[CASE B OPTIMIZED: 16 TPUv6e / 68.72 GB] {label} (seed={seed})", flush=True)
+                          print(f"[CASE B OPTIMIZED: 16 TPUv6e / {total_gb:.2f} GB] {label} (seed={seed})", flush=True)
                           print(f"Total Keys Generated/Conserved : {int(g_count):,} / {total_keys:,} ({total_gb:.2f} GB)", flush=True)
                           print(f"Chip 0 Variable Bucket Sizes   : {chip0_send_list}", flush=True)
                           print(f"Global Validation & Checksum   : [{'PASSED' if bool(passed) else 'FAILED'}] sum={int(g_sum)}", flush=True)
