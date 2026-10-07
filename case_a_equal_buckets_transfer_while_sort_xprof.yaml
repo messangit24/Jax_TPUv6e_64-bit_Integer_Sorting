@@ -1,17 +1,17 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: jax-tpu-svc
+  name: jax-tpu-pipe-svc
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
   selector:
-    job-name: jax-tpu-case-a
+    job-name: jax-tpu-case-a-pipe
 ---
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: jax-tpu-case-a
+  name: jax-tpu-case-a-pipe
 spec:
   completions: 2
   parallelism: 2
@@ -19,9 +19,9 @@ spec:
   template:
     metadata:
       labels:
-        job-name: jax-tpu-case-a
+        job-name: jax-tpu-case-a-pipe
     spec:
-      subdomain: jax-tpu-svc
+      subdomain: jax-tpu-pipe-svc
       restartPolicy: Never
       nodeSelector:
         cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
@@ -52,7 +52,7 @@ spec:
               export LIBTPU_INIT_ARGS="$EXTRA_TPU_ARGS"
               echo "Active LIBTPU_INIT_ARGS: $LIBTPU_INIT_ARGS"
 
-              cat << 'EOF' > /app/case_a_equal_buckets.py
+              cat << 'EOF' > /app/case_a_equal_buckets_transfer_while_sort.py
               import os
               import re
               import glob
@@ -70,9 +70,9 @@ spec:
               from jax.experimental.pallas import tpu as pltpu
 
               # =====================================================================
-              # CASE A: 2D TILED EQUAL-BUCKET CONFIGURATION (8 TPUv6e Chips)
-              #  TILES_PER_BUCKET = 600 -> 50.33 GB Total (6.29 GB / chip)
+              # CASE A: PIPELINED 2D EQUAL-BUCKET CONFIGURATION (8 TPUv6e Chips)
               #   TILES_PER_BUCKET = 1000 -> 83.89 GB Total (10.49 GB / chip)
+              #   NUM_PIPELINE_CHUNKS = 8 -> 125 tiles/chunk (Transfer-While-Sort)
               # =====================================================================
               NUM_CHIPS = 8
               TILES_PER_BUCKET = 1000
@@ -85,6 +85,11 @@ spec:
               TILE_BITS = int(math.ceil(math.log2(TILES_PER_BUCKET))) # 10 bits
               TPU_V6E_VMEM_BYTES = 128 * 1024 * 1024                  # 128 MiB per TensorCore
               TPU_V6E_HBM_BW_GBS = 1640.0                             # 1,640 GB/s per chip
+
+              # Recommendation 5: Communication / Sort Pipelining (Transfer-While-Sort)
+              NUM_PIPELINE_CHUNKS = 8
+              assert TILES_PER_BUCKET % NUM_PIPELINE_CHUNKS == 0, "TILES_PER_BUCKET must be divisible by NUM_PIPELINE_CHUNKS"
+              TILES_PER_CHUNK = TILES_PER_BUCKET // NUM_PIPELINE_CHUNKS  # 125 tiles per chunk
 
               # ---------------------------------------------------------------------
               # PHASE 1: Pallas 2D In-VMEM Key Generation (Zero-Copy Equal Buckets)
@@ -162,36 +167,75 @@ spec:
                       ).reshape(TILES_PER_BUCKET, NUM_CHIPS, KEYS_PER_TILE)
 
               # ---------------------------------------------------------------------
-              # PHASE 2: Direct ICI All-to-All + 2D In-VMEM Tile Sort (Zero-Copy)
+              # PHASE 2: Pipelined ICI All-to-All + Sort (Transfer-While-Sort)
               # ---------------------------------------------------------------------
-              def exchange_and_sort_equal_2d(keys_2d):
-                  with jax.named_scope("Phase2A_ICI_AllToAll_DMA"):
-                      # Optimization #2: All-to-all along chip dimension 1 (preserves bucket order in dim 0)
-                      received = jax.lax.all_to_all(
-                          keys_2d, axis_name='x', split_axis=1, concat_axis=1
+              def exchange_and_sort_pipelined_2d(keys_2d):
+                  """Pipelined Double-Buffered ICI All-to-All and In-VMEM Sort (Transfer-While-Sort).
+                  
+                  Splits keys_2d along the bucket dimension into NUM_PIPELINE_CHUNKS stages.
+                  While chunk (k+1) is transferred over the optical ICI DMA network,
+                  chunk (k) is sorted concurrently on the VPU using Bitonic Sort.
+                  Emits chunks directly as a tuple to eliminate duplicate full-buffer concatenation copies.
+                  """
+                  chunks = [
+                      keys_2d[k * TILES_PER_CHUNK : (k + 1) * TILES_PER_CHUNK]
+                      for k in range(NUM_PIPELINE_CHUNKS)
+                  ]
+                  sorted_chunks = []
+
+                  # Pipeline Prologue: Issue Chunk 0 transfer
+                  with jax.named_scope("Pipeline_Stage_0_Prefetch"):
+                      curr_recv = jax.lax.all_to_all(
+                          chunks[0], axis_name='x', split_axis=1, concat_axis=1
                       )
-                  with jax.named_scope("Phase2B_2D_VMEM_Bitonic_Sort"):
-                      # Pure zero-copy pointer reshape (eliminates 8.4 GB HBM swapaxes transpose)
-                      tiled_buckets = received.reshape(
-                          TILES_PER_BUCKET, NUM_CHIPS * KEYS_PER_TILE
-                      )
-                      return jnp.sort(tiled_buckets, axis=-1)
+
+                  # Overlapped Pipeline Stages: Comm(k+1) || Sort(k)
+                  for k in range(NUM_PIPELINE_CHUNKS - 1):
+                      with jax.named_scope(f"Pipeline_Stage_{k+1}_Comm"):
+                          next_recv = jax.lax.all_to_all(
+                              chunks[k + 1], axis_name='x', split_axis=1, concat_axis=1
+                          )
+                      with jax.named_scope(f"Pipeline_Stage_{k}_Sort"):
+                          curr_tiled = curr_recv.reshape(TILES_PER_CHUNK, NUM_CHIPS * KEYS_PER_TILE)
+                          sorted_chunks.append(jnp.sort(curr_tiled, axis=-1))
+                      curr_recv = next_recv
+
+                  # Pipeline Epilogue: Sort final chunk
+                  with jax.named_scope(f"Pipeline_Stage_{NUM_PIPELINE_CHUNKS - 1}_Sort"):
+                      final_tiled = curr_recv.reshape(TILES_PER_CHUNK, NUM_CHIPS * KEYS_PER_TILE)
+                      sorted_chunks.append(jnp.sort(final_tiled, axis=-1))
+
+                  return tuple(sorted_chunks)
 
               # ---------------------------------------------------------------------
-              # PHASE 3: Validation & Checksum
+              # PHASE 3: Validation & Checksum (Zero-Copy Pipelined Inspection)
               # ---------------------------------------------------------------------
-              def validate_equal_2d(sorted_2d):
+              def validate_pipelined_2d(*sorted_chunks):
                   with jax.named_scope("Phase3_Global_Validation"):
-                      row_ok = jnp.all(sorted_2d[:, :-1] <= sorted_2d[:, 1:])
-                      tile_ok = jnp.all(sorted_2d[:-1, -1] <= sorted_2d[1:, 0])
-                      local_ok = row_ok & tile_ok
+                      chunk_oks = []
+                      chunk_sums = []
+                      for c in sorted_chunks:
+                          row_ok = jnp.all(c[:, :-1] <= c[:, 1:])
+                          tile_ok = jnp.all(c[:-1, -1] <= c[1:, 0])
+                          chunk_oks.append(row_ok & tile_ok)
+                          chunk_sums.append(jnp.sum(c, dtype=jnp.uint64))
 
-                      chip_mins = jax.lax.all_gather(sorted_2d[0, 0], axis_name='x')
-                      chip_maxs = jax.lax.all_gather(sorted_2d[-1, -1], axis_name='x')
+                      # Monotonicity across chunk boundaries
+                      inter_chunk_ok = jnp.bool_(True)
+                      for k in range(len(sorted_chunks) - 1):
+                          inter_chunk_ok = inter_chunk_ok & (sorted_chunks[k][-1, -1] <= sorted_chunks[k + 1][0, 0])
+
+                      local_ok = inter_chunk_ok
+                      for ok in chunk_oks:
+                          local_ok = local_ok & ok
+
+                      # Monotonicity across chip boundaries
+                      chip_mins = jax.lax.all_gather(sorted_chunks[0][0, 0], axis_name='x')
+                      chip_maxs = jax.lax.all_gather(sorted_chunks[-1][-1, -1], axis_name='x')
                       boundary_ok = jnp.all(chip_maxs[:-1] <= chip_mins[1:])
                       all_ok = jnp.all(jax.lax.all_gather(local_ok, axis_name='x')) & boundary_ok
 
-                      local_sum = jnp.sum(sorted_2d, dtype=jnp.uint64)
+                      local_sum = sum(chunk_sums)
                       global_sum = jnp.sum(jax.lax.all_gather(local_sum, axis_name='x'), dtype=jnp.uint64)
                       return all_ok, global_sum
 
@@ -205,7 +249,7 @@ spec:
 
               def print_hardware_telemetry_report(jit_gen, jit_sort, sample_seed, sample_keys, dev0):
                   log_msg("\n" + "=" * 78)
-                  log_msg("   TPU v6e HARDWARE TELEMETRY: DMA, VMEM, VREG, VPU & MXU ANALYSIS")
+                  log_msg("   TPU v6e HARDWARE TELEMETRY: PIPELINED DMA, VMEM, VREG & VPU ANALYSIS")
                   log_msg("=" * 78)
 
                   # 1. Live Device HBM Memory Stats
@@ -222,7 +266,7 @@ spec:
                   try:
                       for stage_name, fn, arg in [
                           ("Phase 1 (Pallas 2D KeyGen)", jit_gen, sample_seed),
-                          ("Phase 2 (AllToAll + 2D VMEM Sort)", jit_sort, sample_keys),
+                          (f"Phase 2 (Pipelined {NUM_PIPELINE_CHUNKS}-Stage AllToAll + Sort)", jit_sort, sample_keys),
                       ]:
                           compiled = fn.lower(arg).compile()
                           ma = compiled.memory_analysis()
@@ -244,10 +288,12 @@ spec:
                   # 3. Architectural VMEM Tile Footprint Check
                   p1_vmem_tile_kb = (TILE_ROWS * TILE_COLS * 4 * 2 * 2) / 1024.0
                   p2_vmem_row_mb = (NUM_CHIPS * KEYS_PER_TILE * 8) / (1024**2)
+                  chunk_hbm_mb = (TILES_PER_CHUNK * NUM_CHIPS * KEYS_PER_TILE * 8) / (1024**2)
                   vmem_total_mb = TPU_V6E_VMEM_BYTES / (1024**2)
                   log_msg(f"\n[VMEM Scratchpad Footprint (128 MiB Total per TensorCore)]")
                   log_msg(f"  Phase 1 Pallas Double-Buffered Tile : {p1_vmem_tile_kb:.1f} KiB ({100*p1_vmem_tile_kb/(vmem_total_mb*1024):.2f}% of VMEM)")
-                  log_msg(f"  Phase 2 2D Sort Row Working Set     : {p2_vmem_row_mb:.2f} MiB ({100*p2_vmem_row_mb/vmem_total_mb:.2f}% of VMEM -> Fits 100% in VMEM!)")
+                  log_msg(f"  Phase 2 Sort Row Working Set        : {p2_vmem_row_mb:.2f} MiB ({100*p2_vmem_row_mb/vmem_total_mb:.2f}% of VMEM -> Fits 100% in VMEM!)")
+                  log_msg(f"  Phase 2 Pipeline Chunk HBM Buffer   : {chunk_hbm_mb:.2f} MiB ({NUM_PIPELINE_CHUNKS} stages of {TILES_PER_CHUNK} tiles)")
 
                   # 4. Parse HLO & LLO Dumps for DMA, VPU, MXU, VREG ($v), and VMEM Spills
                   hlo_files = glob.glob("/tmp/xla_dump/*after_optimizations*.txt") + glob.glob("/tmp/xla_dump/*.llo.txt")
@@ -256,7 +302,7 @@ spec:
                   for fpath in hlo_files:
                       try:
                           txt = open(fpath, "r", errors="ignore").read()
-                          dma_ops += len(re.findall(r"\b(all-to-all|copy-start|copy-done|ragged-all-to-all)\b", txt))
+                          dma_ops += len(re.findall(r"\b(all-to-all|copy-start|copy-done|ragged-all-to-all|all-to-all-start|all-to-all-done)\b", txt))
                           custom_calls += len(re.findall(r"custom-call", txt))
                           sort_ops += len(re.findall(r"\bsort\b", txt))
                           mxu_dots += len(re.findall(r"\b(dot|convolution)\b", txt))
@@ -276,7 +322,7 @@ spec:
                   log_msg("=" * 78 + "\n")
 
               def main():
-                  coordinator = "jax-tpu-case-a-0.jax-tpu-svc.default.svc.cluster.local:1234"
+                  coordinator = "jax-tpu-case-a-pipe-0.jax-tpu-pipe-svc.default.svc.cluster.local:1234"
                   process_id = int(os.environ.get("JOB_COMPLETION_INDEX", 0))
                   num_processes = int(os.environ.get("JOB_COMPLETIONS", 2))
 
@@ -292,14 +338,17 @@ spec:
                   num_devices = len(devices)
                   mesh = Mesh(devices, ('x',))
 
+                  out_specs_sort = tuple(P('x', None) for _ in range(NUM_PIPELINE_CHUNKS))
+                  in_specs_val = tuple(P('x', None) for _ in range(NUM_PIPELINE_CHUNKS))
+
                   jit_gen = jax.jit(shard_map.shard_map(
                       generate_equal_buckets_2d, mesh=mesh, in_specs=P(), out_specs=P('x', None, None), check_rep=False
                   ))
                   jit_sort = jax.jit(shard_map.shard_map(
-                      exchange_and_sort_equal_2d, mesh=mesh, in_specs=P('x', None, None), out_specs=P('x', None), check_rep=False
+                      exchange_and_sort_pipelined_2d, mesh=mesh, in_specs=P('x', None, None), out_specs=out_specs_sort, check_rep=False
                   ))
                   jit_val = jax.jit(shard_map.shard_map(
-                      validate_equal_2d, mesh=mesh, in_specs=P('x', None), out_specs=(P(), P()), check_rep=False
+                      validate_pipelined_2d, mesh=mesh, in_specs=in_specs_val, out_specs=(P(), P()), check_rep=False
                   ))
 
                   total_keys = ELEMENTS_PER_CHIP * num_devices
@@ -320,15 +369,16 @@ spec:
                           t_gen = time.perf_counter() - t0
 
                           t1 = time.perf_counter()
-                          sorted_2d = jit_sort(keys_2d)
-                          sorted_2d.block_until_ready()
+                          sorted_chunks = jit_sort(keys_2d)
+                          for c in sorted_chunks:
+                              c.block_until_ready()
                           t_sort = time.perf_counter() - t1
                           keys_2d = None  # Free input buffer immediately to keep peak memory minimal
 
-                          passed, g_sum = jit_val(sorted_2d)
+                          passed, g_sum = jit_val(*sorted_chunks)
                           passed.block_until_ready()
                           if i < 2:
-                              sorted_2d = None  # Free sorted buffer before next generation run
+                              sorted_chunks = None  # Free sorted buffers before next generation run
 
                       if trace_active:
                           jax.profiler.stop_trace()
@@ -341,12 +391,12 @@ spec:
                           vpu_sort_gops = (TILES_PER_BUCKET * 1048576 * 210 / 1e9) / t_sort
 
                           log_msg("=======================================================")
-                          log_msg(f"[CASE A: EQUAL BUCKETS] {label} (seed={seed})")
+                          log_msg(f"[CASE A: PIPELINED {NUM_PIPELINE_CHUNKS}-STAGE] {label} (seed={seed})")
                           log_msg(f"Total Active TPU Chips   : {num_devices}")
                           log_msg(f"Total Keys Sorted        : {total_keys:,} ({total_gb:.2f} GB)")
                           log_msg(f"Validation & Checksum    : [{'PASSED' if bool(passed) else 'FAILED'}] sum={int(g_sum)}")
                           log_msg(f"Phase 1 (Pallas 2D Gen)  : {t_gen:.4f} s ({total_gb/t_gen:.2f} GB/s cluster | {gen_hbm_util:.1f}% HBM BW | VPU: {vpu_keygen_gops:.1f} GOPS/s/chip)")
-                          log_msg(f"Phase 2 (AllToAll+Sort)  : {t_sort:.4f} s (ICI DMA: {ici_gb/t_sort:.2f} GB/s | {ns_per_item:.4f} ns/key | VPU Sort: {vpu_sort_gops:.1f} GOPS/s/chip)")
+                          log_msg(f"Phase 2 (Pipelined Sort) : {t_sort:.4f} s (Effective ICI: {ici_gb/t_sort:.2f} GB/s | {ns_per_item:.4f} ns/key | VPU Sort: {vpu_sort_gops:.1f} GOPS/s/chip)")
                           if trace_active:
                               log_msg("XProf Trace Captured     : /tmp/xprof (Step 2 steady-state)")
                           log_msg("=======================================================\n")
@@ -374,4 +424,4 @@ spec:
               if __name__ == "__main__":
                   main()
               EOF
-              python3 /app/case_a_equal_buckets.py
+              python3 /app/case_a_equal_buckets_transfer_while_sort.py

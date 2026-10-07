@@ -1,0 +1,420 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: jax-tpu-svc-b-pipe
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    job-name: jax-tpu-case-b-pipelined
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: jax-tpu-case-b-pipelined
+spec:
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        job-name: jax-tpu-case-b-pipelined
+    spec:
+      subdomain: jax-tpu-svc-b-pipe
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: 2x4
+        cloud.google.com/gke-nodepool: mb-tpu-v6e-multi-8
+      containers:
+        - name: jax-tpu-container
+          image: us-docker.pkg.dev/cloud-tpu-images/jax-stable-stack/tpu:jax0.5.2-rev1
+          env:
+            - name: XLA_FLAGS
+              value: "--xla_dump_to=/tmp/xla_dump --xla_dump_hlo_as_text"
+          resources:
+            limits:
+              google.com/tpu: 4
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -ex
+              mkdir -p /tmp/xla_dump /tmp/xprof /app
+              export LIBTPU_INIT_ARGS="--xla_jf_dump_llo_text=true --xla_tpu_enable_latency_hiding_scheduler=true --xla_tpu_enable_async_all_to_all=true"
+              echo "Active LIBTPU_INIT_ARGS: $LIBTPU_INIT_ARGS"
+
+              cat << 'EOF' > /app/case_b_ragged_pipelined.py
+              import os
+              import time
+              import glob
+              import re
+              import jax
+              jax.config.update("jax_enable_x64", True)
+              jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+
+              import jax.numpy as jnp
+              from jax.sharding import Mesh, PartitionSpec as P
+              from jax.experimental import shard_map
+              from jax.experimental import pallas as pl
+              from jax.experimental.pallas import tpu as pltpu
+
+              # ---------------------------------------------------------------------
+              # BENCHMARK CONFIGURATION: CASE B PIPELINED (TRANSFER-AND-SORT)
+              # "Different Bucket Sizes & Pure Unstructured Random Keys"
+              # Pipelined 8-stage chunked execution: overlaps KeyGen || Comm || Sort
+              # ---------------------------------------------------------------------
+              NUM_CHIPS = 8
+              CHIP_BITS = 3
+              NUM_TILES_PER_CHIP = 4096
+              NUM_CHUNKS = 8
+              TILES_PER_CHUNK = NUM_TILES_PER_CHIP // NUM_CHUNKS  # 512 tiles per chunk
+              TILE_BLOCKS = 1024
+              BLOCK_WIDTH = 128
+
+              BLOCKS_PER_CHUNK = TILES_PER_CHUNK * TILE_BLOCKS     # 524,288 blocks
+              KEYS_PER_CHUNK = BLOCKS_PER_CHUNK * BLOCK_WIDTH       # 67,108,864 keys (536.87 MiB)
+              RECV_BUFFER_BLOCKS_PER_CHUNK = int(BLOCKS_PER_CHUNK * 1.10)  # 576,716 blocks (10% safety margin)
+
+              NUM_BLOCKS_PER_CHIP = NUM_TILES_PER_CHIP * TILE_BLOCKS  # 4,194,304 blocks
+              ELEMENTS_PER_CHIP = NUM_BLOCKS_PER_CHIP * BLOCK_WIDTH    # 536,870,912 keys (4.29 GB)
+
+              UINT64_MAX = 0xFFFFFFFFFFFFFFFF
+              TPU_V6E_VMEM_BYTES = 128 * 1024 * 1024
+
+              def sort_u64(arr):
+                  # Map uint64 monotonically into int64 for TPU signed VPU sort:
+                  # 0x0 -> -2^63 (most negative)
+                  # 0xFFFFFFFFFFFFFFFF (padding) -> +2^63 - 1 (most positive)
+                  sign_bit = jnp.uint64(0x8000000000000000)
+                  return (jnp.sort((arr ^ sign_bit).view(jnp.int64))).view(jnp.uint64) ^ sign_bit
+
+              # ---------------------------------------------------------------------
+              # Pallas KeyGen Kernel Factory: Generates bit-identical keys per chunk
+              # ---------------------------------------------------------------------
+              def get_pallas_keygen_kernel(c_offset_val):
+                  def kernel(seed_vmem_ref, hi_out_vmem_ref, lo_out_vmem_ref):
+                      t_local = jnp.uint32(pl.program_id(0))
+                      t_idx = t_local + jnp.uint32(c_offset_val)
+                      grid_offset = jnp.broadcast_to(
+                          (t_idx + jnp.uint32(1)) * jnp.uint32(0x9e3779b9), (TILE_BLOCKS, BLOCK_WIDTH)
+                      )
+                      tile_seed = seed_vmem_ref[...] ^ grid_offset
+
+                      row_iota = jax.lax.broadcasted_iota(jnp.uint32, (TILE_BLOCKS, BLOCK_WIDTH), 0)
+                      col_iota = jax.lax.broadcasted_iota(jnp.uint32, (TILE_BLOCKS, BLOCK_WIDTH), 1)
+                      idx = (row_iota << jnp.uint32(7)) | col_iota
+
+                      lo = idx ^ tile_seed
+                      lo = (lo ^ (lo >> jnp.uint32(16))) * jnp.uint32(0x85ebca6b)
+                      lo = (lo ^ (lo >> jnp.uint32(13))) * jnp.uint32(0xc2b2ae35)
+                      lo = lo ^ (lo >> jnp.uint32(16))
+
+                      block_hash = ((row_iota + (t_idx * jnp.uint32(TILE_BLOCKS))) ^ tile_seed) * jnp.uint32(0x85ebca6b)
+                      block_hash = (block_hash ^ (block_hash >> jnp.uint32(16))) * jnp.uint32(0xc2b2ae35)
+                      hi_bucket_bits = block_hash & jnp.uint32(0xE0000000)
+                      hi_lower_bits = ((lo * jnp.uint32(0x1b873593)) ^ tile_seed) & jnp.uint32(0x1FFFFFFF)
+
+                      hi_out_vmem_ref[...] = hi_bucket_bits | hi_lower_bits
+                      lo_out_vmem_ref[...] = lo
+                  return kernel
+
+              # ---------------------------------------------------------------------
+              # PIPELINED TRANSFER-AND-SORT AS KEYS ARE BEING GENERATED
+              # ---------------------------------------------------------------------
+              def generate_transfer_and_sort_pipelined(iter_seed: jax.Array):
+                  dev_idx = jax.lax.axis_index('x')
+                  chip_seed = jnp.full(
+                      (TILE_BLOCKS, BLOCK_WIDTH),
+                      jnp.uint32(iter_seed) ^ (jnp.uint32(dev_idx + 1) * jnp.uint32(0x7f4a7c15)),
+                      dtype=jnp.uint32,
+                  )
+
+                  received_chunks = []
+                  sorted_chunks = []
+                  chunk_send_sizes = []
+                  chunk_recv_sizes = []
+
+                  def gen_chunk(c_idx):
+                      with jax.named_scope(f"Stage_{c_idx}_Pallas_KeyGen"):
+                          out_shape = jax.ShapeDtypeStruct((TILES_PER_CHUNK, TILE_BLOCKS, BLOCK_WIDTH), jnp.uint32)
+                          kernel_fn = get_pallas_keygen_kernel(c_idx * TILES_PER_CHUNK)
+                          hi_2d, lo_2d = pl.pallas_call(
+                              kernel_fn,
+                              out_shape=(out_shape, out_shape),
+                              grid=(TILES_PER_CHUNK,),
+                              in_specs=[pl.BlockSpec((TILE_BLOCKS, BLOCK_WIDTH), lambda t: (0, 0))],
+                              out_specs=[
+                                  pl.BlockSpec((None, TILE_BLOCKS, BLOCK_WIDTH), lambda t: (t, 0, 0)),
+                                  pl.BlockSpec((None, TILE_BLOCKS, BLOCK_WIDTH), lambda t: (t, 0, 0)),
+                              ],
+                              compiler_params=(getattr(pltpu, "TPUCompilerParams", getattr(pltpu, "CompilerParams", None)))(
+                                  dimension_semantics=("parallel",)
+                              ),
+                              cost_estimate=pl.CostEstimate(
+                                  flops=KEYS_PER_CHUNK * 18,
+                                  transcendentals=0,
+                                  bytes_accessed=KEYS_PER_CHUNK * 8,
+                              ),
+                              name=f"pallas_chunk_keygen_{c_idx}",
+                          )(chip_seed)
+                          return ((hi_2d.astype(jnp.uint64) << jnp.uint64(32)) | lo_2d.astype(jnp.uint64)).reshape(BLOCKS_PER_CHUNK, BLOCK_WIDTH)
+
+                  def comm_chunk(keys_blocks, c_idx):
+                      with jax.named_scope(f"Stage_{c_idx}_ICI_Ragged_Comm"):
+                          block_bucket_ids = (keys_blocks[:, 0] >> jnp.uint64(64 - CHIP_BITS)).astype(jnp.int32)
+                          send_sizes = jnp.bincount(block_bucket_ids, length=NUM_CHIPS).astype(jnp.int32)
+                          input_offsets = (jnp.cumsum(send_sizes) - send_sizes).astype(jnp.int32)
+
+                          bucket_perm = jnp.argsort(block_bucket_ids)
+                          packed_operand = keys_blocks[bucket_perm]
+
+                          recv_sizes = jax.lax.all_to_all(
+                              send_sizes, axis_name='x', split_axis=0, concat_axis=0
+                          )
+                          local_recv_offsets = (jnp.cumsum(recv_sizes) - recv_sizes).astype(jnp.int32)
+                          output_offsets = jax.lax.all_to_all(
+                              local_recv_offsets, axis_name='x', split_axis=0, concat_axis=0
+                          )
+
+                          packed_u32 = packed_operand.view(jnp.uint32).reshape(BLOCKS_PER_CHUNK, BLOCK_WIDTH * 2)
+                          recv_buf_u32 = jnp.full(
+                              (RECV_BUFFER_BLOCKS_PER_CHUNK, BLOCK_WIDTH * 2),
+                              jnp.uint32(0xFFFFFFFF),
+                              dtype=jnp.uint32,
+                          )
+                          received_u32 = jax.lax.ragged_all_to_all(
+                              operand=packed_u32,
+                              output=recv_buf_u32,
+                              input_offsets=input_offsets,
+                              send_sizes=send_sizes,
+                              output_offsets=output_offsets,
+                              recv_sizes=recv_sizes,
+                              axis_name='x',
+                          )
+                          received_blocks = received_u32.view(jnp.uint64).reshape(RECV_BUFFER_BLOCKS_PER_CHUNK, BLOCK_WIDTH)
+                          return received_blocks, send_sizes, recv_sizes
+
+                  def sort_chunk(received_blocks, c_idx):
+                      with jax.named_scope(f"Stage_{c_idx}_VPU_Chunk_Sort"):
+                          return sort_u64(received_blocks.reshape(-1))
+
+                  # Pipeline Prologue (Stage 0): Generate and transfer chunk 0
+                  curr_gen = gen_chunk(0)
+                  curr_recv, curr_send_sz, curr_recv_sz = comm_chunk(curr_gen, 0)
+                  prev_recv = curr_recv
+                  chunk_send_sizes.append(curr_send_sz)
+                  chunk_recv_sizes.append(curr_recv_sz)
+
+                  # Interleaved Pipeline Stages: Overlap Sort(k-1) with Comm(k) and Gen(k)
+                  for k in range(1, NUM_CHUNKS):
+                      sorted_prev = sort_chunk(prev_recv, k - 1)
+                      sorted_chunks.append(sorted_prev)
+
+                      next_gen = gen_chunk(k)
+                      next_recv, next_send_sz, next_recv_sz = comm_chunk(next_gen, k)
+                      prev_recv = next_recv
+                      chunk_send_sizes.append(next_send_sz)
+                      chunk_recv_sizes.append(next_recv_sz)
+
+                  # Pipeline Epilogue: Sort final chunk
+                  sorted_final = sort_chunk(prev_recv, NUM_CHUNKS - 1)
+                  sorted_chunks.append(sorted_final)
+
+                  # Global Local Sort across all received sorted chunks on Chip p
+                  with jax.named_scope("Global_Local_Sort"):
+                      all_received = jnp.concatenate(sorted_chunks, axis=0)
+                      sorted_local = sort_u64(all_received.reshape(-1))
+
+                  total_send_sizes = jnp.sum(jnp.stack(chunk_send_sizes, axis=0), axis=0)
+                  total_recv_sizes = jnp.sum(jnp.stack(chunk_recv_sizes, axis=0), axis=0)
+                  total_valid_keys = jnp.sum(total_recv_sizes, dtype=jnp.int64) * BLOCK_WIDTH
+
+                  return sorted_local, jnp.array([total_valid_keys]), (total_send_sizes * BLOCK_WIDTH)[None, :]
+
+              # ---------------------------------------------------------------------
+              # PHASE 3: Conservation & Global Order Validation
+              # ---------------------------------------------------------------------
+              def validate_ragged(sorted_local, total_valid_keys, send_sizes_2d):
+                  with jax.named_scope("Phase3_Global_Ragged_Validation"):
+                      valid_cnt = total_valid_keys[0]
+                      idx_pair = jnp.arange(sorted_local.shape[0] - 1, dtype=jnp.int64)
+                      valid_pair_mask = idx_pair < (valid_cnt - 1)
+                      local_valid_ok = jnp.all(jnp.where(valid_pair_mask, sorted_local[:-1] <= sorted_local[1:], True))
+                      local_full_ok = jnp.all(sorted_local[:-1] <= sorted_local[1:])
+                      local_ok = local_valid_ok & local_full_ok
+                      my_min = sorted_local[0]
+                      my_max = sorted_local[valid_cnt - 1]
+
+                      chip_mins = jax.lax.all_gather(my_min, axis_name='x')
+                      chip_maxs = jax.lax.all_gather(my_max, axis_name='x')
+                      boundary_ok = jnp.all(chip_maxs[:-1] <= chip_mins[1:])
+
+                      global_valid_keys = jnp.sum(jax.lax.all_gather(valid_cnt, axis_name='x'))
+                      conservation_ok = (global_valid_keys == (ELEMENTS_PER_CHIP * NUM_CHIPS))
+
+                      idx = jnp.arange(sorted_local.shape[0], dtype=jnp.int64)
+                      valid_mask = idx < valid_cnt
+                      local_sum = jnp.sum(jnp.where(valid_mask, sorted_local, jnp.uint64(0)), dtype=jnp.uint64)
+                      global_sum = jnp.sum(jax.lax.all_gather(local_sum, axis_name='x'), dtype=jnp.uint64)
+
+                      all_local_ok = jnp.all(jax.lax.all_gather(local_ok, axis_name='x'))
+                      all_ok = all_local_ok & boundary_ok & conservation_ok
+                      all_send_sizes = jax.lax.all_gather(send_sizes_2d, axis_name='x')
+                      chip0_sizes = all_send_sizes[0, 0]
+                      return all_ok, global_sum, global_valid_keys, chip0_sizes, all_local_ok, boundary_ok, conservation_ok, chip_mins, chip_maxs
+
+              def print_hardware_telemetry_report(jit_pipelined, sample_seed, dev0):
+                  print("\n" + "=" * 78, flush=True)
+                  print("   TPU v6e HARDWARE TELEMETRY: PIPELINED RAGGED DMA, VMEM, VREG & VPU", flush=True)
+                  print("=" * 78, flush=True)
+
+                  try:
+                      mem_stats = dev0.memory_stats() or {}
+                  except Exception:
+                      mem_stats = {}
+                  bytes_in_use = mem_stats.get("bytes_in_use", 0) / (1024**3)
+                  peak_bytes = mem_stats.get("peak_bytes_in_use", 0) / (1024**3)
+                  bytes_limit = mem_stats.get("bytes_limit", 32 * 1024**3) / (1024**3)
+                  print(f"[HBM Live Usage (Chip 0)] In-Use: {bytes_in_use:.2f} GiB | Peak: {peak_bytes:.2f} GiB / {bytes_limit:.2f} GiB ({100*peak_bytes/max(bytes_limit,1):.1f}%)", flush=True)
+
+                  try:
+                      compiled = jit_pipelined.lower(sample_seed).compile()
+                      ma = compiled.memory_analysis()
+                      ca = compiled.cost_analysis()
+                      print(f"\n--- Pipelined (Transfer-While-Sort) Compiler Analysis ---", flush=True)
+                      if ma is not None:
+                          temp_mb = getattr(ma, "temp_size_in_bytes", 0) / (1024**2)
+                          arg_mb = getattr(ma, "argument_size_in_bytes", 0) / (1024**2)
+                          out_mb = getattr(ma, "output_size_in_bytes", 0) / (1024**2)
+                          print(f"  Buffer Footprint : Args={arg_mb:.2f} MiB | Output={out_mb:.2f} MiB | Temp={temp_mb:.2f} MiB", flush=True)
+                      if ca is not None and isinstance(ca, dict):
+                          flops = ca.get("flops", 0.0)
+                          bytes_acc = ca.get("bytes accessed", 0.0)
+                          print(f"  Cost Model Est.  : VPU Ops={flops:,.0f} | Bytes Accessed={bytes_acc/(1024**3):.2f} GiB", flush=True)
+                  except Exception as e:
+                      print(f"\n[Compiler Analysis Note]: {e}", flush=True)
+
+                  hlo_files = glob.glob("/tmp/xla_dump/*after_optimizations*.txt") + glob.glob("/tmp/xla_dump/*.llo.txt")
+                  ragged_dmas, a2a_ops, custom_calls, sort_ops, mxu_dots = 0, 0, 0, 0, 0
+                  vregs_seen, sregs_seen = set(), set()
+                  for fpath in hlo_files:
+                      try:
+                          txt = open(fpath, "r", errors="ignore").read()
+                          ragged_dmas += len(re.findall(r"ragged-all-to-all", txt))
+                          a2a_ops += len(re.findall(r"\b(all-to-all|copy-start|copy-done)\b", txt))
+                          custom_calls += len(re.findall(r"custom-call", txt))
+                          sort_ops += len(re.findall(r"\bsort\b", txt))
+                          mxu_dots += len(re.findall(r"\b(dot|convolution)\b", txt))
+                          vregs_seen.update(re.findall(r"(?:\$v|%v)\d+", txt))
+                          sregs_seen.update(re.findall(r"(?:\$s|%s)\d+", txt))
+                      except Exception:
+                          pass
+                  print(f"\n[HLO / LLO Instruction & Register Breakdown (/tmp/xla_dump)]", flush=True)
+                  print(f"  Ragged-All-To-All Variable RDMA Ops : {ragged_dmas}", flush=True)
+                  print(f"  Standard DMA / Collective Ops       : {a2a_ops}", flush=True)
+                  print(f"  Pallas Custom-Call Kernels Lowered  : {custom_calls}", flush=True)
+                  print(f"  VPU Sort / Radix Permute Regions    : {sort_ops}", flush=True)
+                  print(f"  MXU Matrix Multiply (dot/conv) Ops  : {mxu_dots} (0% MXU -> 100% VPU + DMA workload!)", flush=True)
+                  if vregs_seen or sregs_seen:
+                      print(f"  LLO Registers Referenced            : {len(vregs_seen)} VREGs ($v) | {len(sregs_seen)} SREGs ($s)", flush=True)
+                  print("=" * 78 + "\n", flush=True)
+
+              def main():
+                  coordinator = "jax-tpu-case-b-pipelined-0.jax-tpu-svc-b-pipe.default.svc.cluster.local:1234"
+                  process_id = int(os.environ.get("JOB_COMPLETION_INDEX", 0))
+                  num_processes = int(os.environ.get("JOB_COMPLETIONS", 2))
+
+                  print(f"[POD {process_id}] Initializing JAX distributed (coordinator={coordinator}, num_processes={num_processes})...", flush=True)
+                  if num_processes > 1:
+                      jax.distributed.initialize(
+                          coordinator_address=coordinator,
+                          num_processes=num_processes,
+                          process_id=process_id,
+                          initialization_timeout=1800,
+                      )
+
+                  devices = jax.devices()
+                  num_devices = len(devices)
+                  print(f"[POD {process_id}] JAX distributed initialized! Devices ({num_devices}): {devices}", flush=True)
+                  mesh = Mesh(devices, ('x',))
+
+                  jit_pipelined = jax.jit(shard_map.shard_map(
+                      generate_transfer_and_sort_pipelined,
+                      mesh=mesh,
+                      in_specs=P(),
+                      out_specs=(P('x'), P('x'), P('x', None)),
+                      check_rep=False,
+                  ))
+                  jit_val = jax.jit(shard_map.shard_map(
+                      validate_ragged,
+                      mesh=mesh,
+                      in_specs=(P('x'), P('x'), P('x', None)),
+                      out_specs=(P(), P(), P(), P(), P(), P(), P(), P(), P()),
+                      check_rep=False,
+                  ))
+
+                  total_keys = ELEMENTS_PER_CHIP * num_devices
+                  total_gb = (total_keys * 8) / 1e9
+                  ici_gb = total_gb * ((num_devices - 1) / num_devices)
+
+                  for i, seed in enumerate([111, 222, 333]):
+                      label = "COLD (incl. compile)" if i == 0 else f"WARM #{i} (steady-state)"
+                      print(f"[POD {process_id}] Starting step {i}: {label} (seed={seed})...", flush=True)
+                      trace_active = (i == 2)
+                      if trace_active:
+                          jax.profiler.start_trace("/tmp/xprof")
+
+                      with jax.profiler.StepTraceAnnotation("ragged_pipelined_step", step_num=i):
+                          t0 = time.perf_counter()
+                          sorted_keys, valid_cnt, sent_counts = jit_pipelined(jnp.uint32(seed))
+                          sorted_keys.block_until_ready()
+                          t_pipe = time.perf_counter() - t0
+
+                          res = jit_val(sorted_keys, valid_cnt, sent_counts)
+                          passed, g_sum, g_count, chip0_send, l_ok, b_ok, c_ok, c_mins, c_maxs = res
+                          passed.block_until_ready()
+
+                          # Explicitly delete the 8.80 GiB on-device array to avoid OOM in next iteration
+                          sorted_keys.delete()
+
+                      if trace_active:
+                          jax.profiler.stop_trace()
+
+                      if process_id == 0:
+                          ns_per_item = (t_pipe * 1e9) / total_keys
+                          chip0_send_list = [int(x) for x in chip0_send.tolist()]
+                          print("=======================================================", flush=True)
+                          print(f"[CASE B PIPELINED: TRANSFER-AND-SORT] {label} (seed={seed})", flush=True)
+                          print(f"Total Keys Generated/Conserved : {int(g_count):,} / {total_keys:,} ({total_gb:.2f} GB)", flush=True)
+                          print(f"Chip 0 Variable Bucket Sizes   : {chip0_send_list}", flush=True)
+                          print(f"Global Validation & Checksum   : [{'PASSED' if bool(passed) else 'FAILED'}] sum={int(g_sum)} (local={bool(l_ok)}, boundary={bool(b_ok)}, cons={bool(c_ok)})", flush=True)
+                          print(f"Chip Mins                      : {[hex(int(x)) for x in c_mins.tolist()]}", flush=True)
+                          print(f"Chip Maxs                      : {[hex(int(x)) for x in c_maxs.tolist()]}", flush=True)
+                          print(f"End-to-End Pipelined Time      : {t_pipe:.4f} s ({total_gb/t_pipe:.2f} GB/s total | ICI DMA: {ici_gb/t_pipe:.2f} GB/s | {ns_per_item:.4f} ns/key)", flush=True)
+                          if trace_active:
+                              print("XProf Trace Captured           : /tmp/xprof (Step 2 steady-state)", flush=True)
+                          print("=======================================================\n", flush=True)
+
+                  if process_id == 0:
+                      print_hardware_telemetry_report(jit_pipelined, jnp.uint32(333), jax.local_devices()[0])
+
+                  # Clean coordination teardown across all worker pods
+                  try:
+                      jax.distributed.shutdown()
+                  except Exception:
+                      pass
+
+                  if process_id == 0:
+                      print("Pod 0 holding /tmp/xprof and /tmp/xla_dump open for 20s so you can 'kubectl cp' them...", flush=True)
+                      time.sleep(20)
+
+              if __name__ == "__main__":
+                  try:
+                      main()
+                  except Exception:
+                      import traceback
+                      traceback.print_exc()
+                      raise
+              EOF
+              python3 -u /app/case_b_ragged_pipelined.py 2>&1

@@ -43,7 +43,7 @@ spec:
 
               # Dynamically probe libtpu.so for supported telemetry & optimization flags
               EXTRA_TPU_ARGS=""
-              for FLAG in "xla_jf_dump_llo_text" "xla_enable_custom_call_region_trace" "xla_xprof_enable_custom_call_tracing" "xla_xprof_register_llo_debug_info"; do
+              for FLAG in "xla_jf_dump_llo_text" "xla_enable_custom_call_region_trace" "xla_xprof_enable_custom_call_tracing" "xla_xprof_register_llo_debug_info" "xla_tpu_enable_latency_hiding_scheduler" "xla_tpu_enable_async_all_to_all" "xla_tpu_overlap_all_to_all"; do
                 if python3 -c "import glob, libtpu, os, sys; so=glob.glob(os.path.dirname(libtpu.__file__)+'/*libtpu*.so')[0]; sys.exit(0 if b'$FLAG' in open(so,'rb').read() else 1)" 2>/dev/null; then
                   EXTRA_TPU_ARGS="$EXTRA_TPU_ARGS --${FLAG}=true"
                 fi
@@ -77,12 +77,14 @@ spec:
 
               BLOCK_WIDTH = 128
               TILE_BLOCKS = 1024
-              NUM_TILES_PER_CHIP = 512
+              NUM_TILES_PER_CHIP = 4096
               NUM_BLOCKS_PER_CHIP = NUM_TILES_PER_CHIP * TILE_BLOCKS
               ELEMENTS_PER_CHIP = NUM_BLOCKS_PER_CHIP * BLOCK_WIDTH
 
-              RECV_BUFFER_BLOCKS = int(NUM_BLOCKS_PER_CHIP * 1.05)
-              UINT64_MAX = jnp.uint64(0xFFFFFFFFFFFFFFFF)
+              NUM_PASSES = 8
+              BLOCKS_PER_PASS = NUM_BLOCKS_PER_CHIP // NUM_PASSES
+              RECV_BLOCKS_PER_PASS = int(BLOCKS_PER_PASS * 1.10)
+              UINT64_MAX = 0xFFFFFFFFFFFFFFFF
               TPU_V6E_VMEM_BYTES = 128 * 1024 * 1024
               TPU_V6E_HBM_BW_GBS = 1640.0
 
@@ -133,7 +135,7 @@ spec:
                               pl.BlockSpec((None, TILE_BLOCKS, BLOCK_WIDTH), lambda t: (t, 0, 0)),
                               pl.BlockSpec((None, TILE_BLOCKS, BLOCK_WIDTH), lambda t: (t, 0, 0)),
                           ],
-                          compiler_params=pltpu.TPUCompilerParams(
+                          compiler_params=(getattr(pltpu, "TPUCompilerParams", getattr(pltpu, "CompilerParams", None)))(
                               dimension_semantics=("parallel",)
                           ),
                           cost_estimate=pl.CostEstimate(
@@ -151,68 +153,86 @@ spec:
 
               # ---------------------------------------------------------------------
               # PHASE 2: Dynamic Bucket Counting + Ragged All-to-All + Local Sort
+              # (Split into 512 MiB passes to adhere to 2 GiB DMA addressing limit)
               # ---------------------------------------------------------------------
               def ragged_exchange_and_sort(keys_blocks):
-                  with jax.named_scope("Phase2A_Dynamic_Bucket_Histogram"):
-                      block_bucket_ids = (keys_blocks[:, 0] >> jnp.uint64(64 - CHIP_BITS)).astype(jnp.int32)
-                      send_sizes = jnp.bincount(block_bucket_ids, length=NUM_CHIPS).astype(jnp.int32)
-                      input_offsets = (jnp.cumsum(send_sizes) - send_sizes).astype(jnp.int32)
+                  all_recv_blocks = []
+                  all_send_counts = []
+                  all_recv_counts = []
 
-                      bucket_perm = jnp.argsort(block_bucket_ids)
-                      packed_operand = keys_blocks[bucket_perm]
+                  for p in range(NUM_PASSES):
+                      pass_blocks = keys_blocks[p * BLOCKS_PER_PASS : (p + 1) * BLOCKS_PER_PASS]
+                      with jax.named_scope(f"Phase2A_Pass_{p}_Dynamic_Bucket_Histogram"):
+                          block_bucket_ids = (pass_blocks[:, 0] >> jnp.uint64(64 - CHIP_BITS)).astype(jnp.int32)
+                          send_sizes = jnp.bincount(block_bucket_ids, length=NUM_CHIPS).astype(jnp.int32)
+                          input_offsets = (jnp.cumsum(send_sizes) - send_sizes).astype(jnp.int32)
 
-                      recv_sizes = jax.lax.all_to_all(
-                          send_sizes, axis_name='x', split_axis=0, concat_axis=0
-                      )
-                      local_recv_offsets = (jnp.cumsum(recv_sizes) - recv_sizes).astype(jnp.int32)
-                      output_offsets = jax.lax.all_to_all(
-                          local_recv_offsets, axis_name='x', split_axis=0, concat_axis=0
-                      )
+                          bucket_perm = jnp.argsort(block_bucket_ids)
+                          packed_operand = pass_blocks[bucket_perm]
 
-                  with jax.named_scope("Phase2B_ICI_Ragged_AllToAll_DMA"):
-                      recv_buffer = jnp.full(
-                          (RECV_BUFFER_BLOCKS, BLOCK_WIDTH), UINT64_MAX, dtype=jnp.uint64
-                      )
-                      received_blocks = jax.lax.ragged_all_to_all(
-                          operand=packed_operand,
-                          output=recv_buffer,
-                          input_offsets=input_offsets,
-                          send_sizes=send_sizes,
-                          output_offsets=output_offsets,
-                          recv_sizes=recv_sizes,
-                          axis_name='x',
-                      )
+                          recv_sizes = jax.lax.all_to_all(
+                              send_sizes, axis_name='x', split_axis=0, concat_axis=0
+                          )
+                          local_recv_offsets = (jnp.cumsum(recv_sizes) - recv_sizes).astype(jnp.int32)
+                          output_offsets = jax.lax.all_to_all(
+                              local_recv_offsets, axis_name='x', split_axis=0, concat_axis=0
+                          )
 
-                  with jax.named_scope("Phase2C_Local_VPU_Sort"):
-                      flat_received = received_blocks.reshape(-1)
+                      with jax.named_scope(f"Phase2B_Pass_{p}_ICI_Ragged_AllToAll_DMA"):
+                          # Zero-copy view to uint32 to bypass XLA X64-rewriter limitation on ragged_all_to_all
+                          packed_operand_u32 = packed_operand.view(jnp.uint32).reshape(BLOCKS_PER_PASS, BLOCK_WIDTH * 2)
+                          recv_buffer_u32 = jnp.full(
+                              (RECV_BLOCKS_PER_PASS, BLOCK_WIDTH * 2), jnp.uint32(0xFFFFFFFF), dtype=jnp.uint32
+                          )
+                          received_blocks_u32 = jax.lax.ragged_all_to_all(
+                              operand=packed_operand_u32,
+                              output=recv_buffer_u32,
+                              input_offsets=input_offsets,
+                              send_sizes=send_sizes,
+                              output_offsets=output_offsets,
+                              recv_sizes=recv_sizes,
+                              axis_name='x',
+                          )
+                          received_blocks = received_blocks_u32.view(jnp.uint64).reshape(RECV_BLOCKS_PER_PASS, BLOCK_WIDTH)
+                          all_recv_blocks.append(received_blocks)
+                          all_send_counts.append(send_sizes)
+                          all_recv_counts.append(recv_sizes)
+
+                  with jax.named_scope("Phase2C_Global_Local_VPU_Sort"):
+                      flat_received = jnp.concatenate(all_recv_blocks, axis=0).reshape(-1)
                       sorted_local = jnp.sort(flat_received)
-                      total_valid_keys = jnp.sum(recv_sizes, dtype=jnp.int64) * BLOCK_WIDTH
+                      tot_recv_sizes = jnp.sum(jnp.stack(all_recv_counts, axis=0), axis=0)
+                      tot_send_sizes = jnp.sum(jnp.stack(all_send_counts, axis=0), axis=0)
+                      total_valid_keys = jnp.sum(tot_recv_sizes, dtype=jnp.int64) * BLOCK_WIDTH
 
-                  return sorted_local, send_sizes * BLOCK_WIDTH, recv_sizes * BLOCK_WIDTH, total_valid_keys
+                  return sorted_local, jnp.array([total_valid_keys]), (tot_send_sizes * BLOCK_WIDTH)[None, :]
 
               # ---------------------------------------------------------------------
               # PHASE 3: Conservation & Global Order Validation
               # ---------------------------------------------------------------------
-              def validate_ragged(sorted_local, total_valid_keys):
+              def validate_ragged(sorted_local, total_valid_keys, send_sizes_2d):
                   with jax.named_scope("Phase3_Global_Ragged_Validation"):
                       local_ok = jnp.all(sorted_local[:-1] <= sorted_local[1:])
+                      valid_cnt = total_valid_keys[0]
                       my_min = sorted_local[0]
-                      my_max = sorted_local[total_valid_keys - 1]
+                      my_max = sorted_local[valid_cnt - 1]
 
                       chip_mins = jax.lax.all_gather(my_min, axis_name='x')
                       chip_maxs = jax.lax.all_gather(my_max, axis_name='x')
                       boundary_ok = jnp.all(chip_maxs[:-1] <= chip_mins[1:])
 
-                      global_valid_keys = jnp.sum(jax.lax.all_gather(total_valid_keys, axis_name='x'))
+                      global_valid_keys = jnp.sum(jax.lax.all_gather(valid_cnt, axis_name='x'))
                       conservation_ok = (global_valid_keys == (ELEMENTS_PER_CHIP * NUM_CHIPS))
 
                       idx = jnp.arange(sorted_local.shape[0], dtype=jnp.int64)
-                      valid_mask = idx < total_valid_keys
+                      valid_mask = idx < valid_cnt
                       local_sum = jnp.sum(jnp.where(valid_mask, sorted_local, jnp.uint64(0)), dtype=jnp.uint64)
                       global_sum = jnp.sum(jax.lax.all_gather(local_sum, axis_name='x'), dtype=jnp.uint64)
 
                       all_ok = jnp.all(jax.lax.all_gather(local_ok, axis_name='x')) & boundary_ok & conservation_ok
-                      return all_ok, global_sum, global_valid_keys
+                      all_send_sizes = jax.lax.all_gather(send_sizes_2d, axis_name='x')
+                      chip0_sizes = all_send_sizes[0, 0]
+                      return all_ok, global_sum, global_valid_keys, chip0_sizes
 
               def print_hardware_telemetry_report(jit_gen, jit_ragged_sort, sample_seed, sample_blocks, dev0):
                   print("\n" + "=" * 78, flush=True)
@@ -226,7 +246,7 @@ spec:
                       mem_stats = {}
                   bytes_in_use = mem_stats.get("bytes_in_use", 0) / (1024**3)
                   peak_bytes = mem_stats.get("peak_bytes_in_use", 0) / (1024**3)
-                  bytes_limit = mem_stats.get("bytes_limit", 16 * 1024**3) / (1024**3)
+                  bytes_limit = mem_stats.get("bytes_limit", 32 * 1024**3) / (1024**3)
                   print(f"[HBM Live Usage (Chip 0)] In-Use: {bytes_in_use:.2f} GiB | Peak: {peak_bytes:.2f} GiB / {bytes_limit:.2f} GiB ({100*peak_bytes/max(bytes_limit,1):.1f}%)", flush=True)
 
                   try:
@@ -280,6 +300,7 @@ spec:
                   process_id = int(os.environ.get("JOB_COMPLETION_INDEX", 0))
                   num_processes = int(os.environ.get("JOB_COMPLETIONS", 2))
 
+                  print(f"[POD {process_id}] Initializing JAX distributed (coordinator={coordinator}, num_processes={num_processes})...", flush=True)
                   if num_processes > 1:
                       jax.distributed.initialize(
                           coordinator_address=coordinator,
@@ -290,6 +311,7 @@ spec:
 
                   devices = jax.devices()
                   num_devices = len(devices)
+                  print(f"[POD {process_id}] JAX distributed initialized! Devices ({num_devices}): {devices}", flush=True)
                   mesh = Mesh(devices, ('x',))
 
                   jit_gen = jax.jit(shard_map.shard_map(
@@ -299,11 +321,11 @@ spec:
                       ragged_exchange_and_sort,
                       mesh=mesh,
                       in_specs=P('x', None),
-                      out_specs=(P('x'), P('x'), P('x'), P('x')),
+                      out_specs=(P('x'), P('x'), P('x', None)),
                       check_rep=False,
                   ))
                   jit_val = jax.jit(shard_map.shard_map(
-                      validate_ragged, mesh=mesh, in_specs=(P('x'), P('x')), out_specs=(P(), P(), P()), check_rep=False
+                      validate_ragged, mesh=mesh, in_specs=(P('x'), P('x'), P('x', None)), out_specs=(P(), P(), P(), P()), check_rep=False
                   ))
 
                   total_keys = ELEMENTS_PER_CHIP * num_devices
@@ -312,6 +334,7 @@ spec:
 
                   for i, seed in enumerate([111, 222, 333]):
                       label = "COLD (incl. compile)" if i == 0 else f"WARM #{i} (steady-state)"
+                      print(f"[POD {process_id}] Starting step {i}: {label} (seed={seed})...", flush=True)
                       trace_active = (i == 2)
                       if trace_active:
                           jax.profiler.start_trace("/tmp/xprof")
@@ -323,11 +346,11 @@ spec:
                           t_gen = time.perf_counter() - t0
 
                           t1 = time.perf_counter()
-                          sorted_keys, sent_counts, recv_counts, valid_cnt = jit_ragged_sort(raw_blocks)
+                          sorted_keys, valid_cnt, sent_counts = jit_ragged_sort(raw_blocks)
                           sorted_keys.block_until_ready()
                           t_sort = time.perf_counter() - t1
 
-                          passed, g_sum, g_count = jit_val(sorted_keys, valid_cnt)
+                          passed, g_sum, g_count, chip0_send = jit_val(sorted_keys, valid_cnt, sent_counts)
                           passed.block_until_ready()
 
                       if trace_active:
@@ -335,11 +358,11 @@ spec:
 
                       if process_id == 0:
                           ns_per_item = (t_sort * 1e9) / total_keys
-                          chip0_send = [int(x) for x in sent_counts[:num_devices]]
+                          chip0_send_list = [int(x) for x in chip0_send.tolist()]
                           print("=======================================================", flush=True)
                           print(f"[CASE B: RAGGED VARIABLE BUCKETS] {label} (seed={seed})", flush=True)
                           print(f"Total Keys Generated/Conserved : {int(g_count):,} / {total_keys:,} ({total_gb:.2f} GB)", flush=True)
-                          print(f"Chip 0 Variable Bucket Sizes   : {chip0_send}", flush=True)
+                          print(f"Chip 0 Variable Bucket Sizes   : {chip0_send_list}", flush=True)
                           print(f"Global Validation & Checksum   : [{'PASSED' if bool(passed) else 'FAILED'}] sum={int(g_sum)}", flush=True)
                           print(f"Phase 1 (Pallas Unstructured)  : {t_gen:.4f} s ({total_gb/t_gen:.2f} GB/s)", flush=True)
                           print(f"Phase 2 (RaggedA2A + Sort)     : {t_sort:.4f} s (ICI DMA: {ici_gb/t_sort:.2f} GB/s | {ns_per_item:.4f} ns/key)", flush=True)
@@ -348,11 +371,25 @@ spec:
                           print("=======================================================\n", flush=True)
 
                   if process_id == 0:
-                      print_hardware_telemetry_report(jit_gen, jit_ragged_sort, jnp.uint32(333), raw_blocks, jax.local_devices()[0])
-                      print("Pod 0 holding /tmp/xprof and /tmp/xla_dump open for 600s so you can 'kubectl cp' them...", flush=True)
-                      time.sleep(600)
+                      sample_blocks_shape = jax.ShapeDtypeStruct((num_devices * NUM_BLOCKS_PER_CHIP, BLOCK_WIDTH), jnp.uint64)
+                      print_hardware_telemetry_report(jit_gen, jit_ragged_sort, jnp.uint32(333), sample_blocks_shape, jax.local_devices()[0])
+
+                  # Clean coordination teardown across all worker pods
+                  try:
+                      jax.distributed.shutdown()
+                  except Exception:
+                      pass
+
+                  if process_id == 0:
+                      print("Pod 0 holding /tmp/xprof and /tmp/xla_dump open for 20s so you can 'kubectl cp' them...", flush=True)
+                      time.sleep(20)
 
               if __name__ == "__main__":
-                  main()
+                  try:
+                      main()
+                  except Exception:
+                      import traceback
+                      traceback.print_exc()
+                      raise
               EOF
-              python3 /app/case_b_ragged_unstructured.py
+              python3 -u /app/case_b_ragged_unstructured.py 2>&1
