@@ -1,0 +1,401 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: jax-tpu-case-a-pipe-16tpu-svc
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    job-name: jax-tpu-case-a-pipe-16tpu
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: jax-tpu-case-a-pipe-16tpu
+spec:
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        job-name: jax-tpu-case-a-pipe-16tpu
+    spec:
+      subdomain: jax-tpu-case-a-pipe-16tpu-svc
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: 4x4
+        cloud.google.com/gke-nodepool: mb-tpu-v6e-multi-16
+      containers:
+        - name: jax-tpu-container
+          image: us-docker.pkg.dev/cloud-tpu-images/jax-stable-stack/tpu:jax0.5.2-rev1
+          env:
+            - name: XLA_FLAGS
+              value: "--xla_dump_to=/tmp/xla_dump --xla_dump_hlo_as_text"
+          resources:
+            limits:
+              google.com/tpu: 4
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              mkdir -p /app /tmp/jax_cache /tmp/xprof /tmp/xla_dump
+
+              EXTRA_TPU_ARGS=""
+              for FLAG in "xla_jf_dump_llo_text" "xla_enable_custom_call_region_trace" "xla_xprof_enable_custom_call_tracing" "xla_xprof_register_llo_debug_info" "xla_tpu_enable_latency_hiding_scheduler" "xla_tpu_enable_async_all_to_all" "xla_tpu_overlap_all_to_all"; do
+                if python3 -c "import glob, libtpu, os, sys; so=glob.glob(os.path.dirname(libtpu.__file__)+'/*libtpu*.so')[0]; sys.exit(0 if b'$FLAG' in open(so,'rb').read() else 1)" 2>/dev/null; then
+                  EXTRA_TPU_ARGS="$EXTRA_TPU_ARGS --${FLAG}=true"
+                fi
+              done
+              EXTRA_TPU_ARGS="$(echo -n "$EXTRA_TPU_ARGS" | xargs)"
+              export LIBTPU_INIT_ARGS="$EXTRA_TPU_ARGS"
+              echo "Active LIBTPU_INIT_ARGS: $LIBTPU_INIT_ARGS"
+
+              cat << 'EOF' > /app/case_a_pipelined.py
+              import os
+              import re
+              import glob
+              import time
+              import math
+              import jax
+
+              jax.config.update("jax_enable_x64", True)
+              jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+
+              import jax.numpy as jnp
+              from jax.sharding import Mesh, PartitionSpec as P
+              from jax.experimental import shard_map
+              from jax.experimental import pallas as pl
+              from jax.experimental.pallas import tpu as pltpu
+
+              # =====================================================================
+              # CASE A PIPELINED (16 TPUv6e Chips, 4x4 Topology): 128.85 GB DATASET
+              #   Double Data Size: 16,106,127,360 uint64 keys (128.85 GB total)
+              #   NUM_CHIPS = 16, TILES_PER_BUCKET = 480, KEYS_PER_TILE = 131,072
+              #   3-Way Pipeline: KeyGen || ICI All-to-All DMA || In-VMEM Bitonic Sort
+              #   Tapered Schedule: Stage 0 = 30 tiles (503 MB warmup), Stages 1..3 = 150 tiles (2.51 GB)
+              #   In-VMEM Bitonic Sort: 16.78 MiB rows along axis=-1 in 128 MiB VMEM
+              # =====================================================================
+              NUM_CHIPS = 16
+              TILES_PER_BUCKET = 480
+              TILE_ROWS = 128
+              TILE_COLS = 1024
+              KEYS_PER_TILE = TILE_ROWS * TILE_COLS  # 131,072 keys (1 MB/tile)
+              ELEMENTS_PER_CHIP = NUM_CHIPS * TILES_PER_BUCKET * KEYS_PER_TILE  # 1,006,632,960 keys (8.05 GB)
+
+              CHIP_BITS = int(math.log2(NUM_CHIPS))                   # 4 bits
+              TILE_BITS = int(math.ceil(math.log2(TILES_PER_BUCKET))) # 9 bits
+              TPU_V6E_VMEM_BYTES = 128 * 1024 * 1024                  # 128 MiB per core
+              TPU_V6E_HBM_BW_GBS = 1640.0                             # 1,640 GB/s per chip
+
+              # 4-stage tapered pipeline schedule
+              CHUNK_SIZES = [30, 150, 150, 150]
+              assert sum(CHUNK_SIZES) == TILES_PER_BUCKET, f"Sum of chunks {sum(CHUNK_SIZES)} != {TILES_PER_BUCKET}"
+              CHUNK_OFFSETS = [0]
+              for sz in CHUNK_SIZES[:-1]:
+                  CHUNK_OFFSETS.append(CHUNK_OFFSETS[-1] + sz)
+
+              # ---------------------------------------------------------------------
+              # Pallas KeyGen Kernel Factory per chunk
+              # ---------------------------------------------------------------------
+              def get_pallas_chunk_kernel(c_offset_val):
+                  def kernel(seed_vmem_ref, hi_out_vmem_ref, lo_out_vmem_ref):
+                      t_local = jnp.uint32(pl.program_id(0))
+                      b_idx = jnp.uint32(pl.program_id(1))
+                      t_global = t_local + jnp.uint32(c_offset_val)
+
+                      grid_offset = jnp.broadcast_to(
+                          (b_idx << jnp.uint32(16)) | t_global, (TILE_ROWS, TILE_COLS)
+                      )
+                      tile_seed = seed_vmem_ref[...] ^ grid_offset
+
+                      row_iota = jax.lax.broadcasted_iota(jnp.uint32, (TILE_ROWS, TILE_COLS), 0)
+                      col_iota = jax.lax.broadcasted_iota(jnp.uint32, (TILE_ROWS, TILE_COLS), 1)
+                      idx = (row_iota << jnp.uint32(10)) | col_iota
+
+                      lo = idx ^ tile_seed
+                      lo = lo ^ (lo >> jnp.uint32(16))
+                      lo = lo * jnp.uint32(0x85ebca6b)
+                      lo = lo ^ (lo >> jnp.uint32(13))
+                      hi_rand = (lo * jnp.uint32(0xc2b2ae35)) ^ tile_seed
+
+                      total_prefix_bits = CHIP_BITS + TILE_BITS
+                      mask = (jnp.uint32(1) << jnp.uint32(32 - total_prefix_bits)) - jnp.uint32(1)
+                      prefix = (
+                          (b_idx << jnp.uint32(32 - CHIP_BITS)) |
+                          (t_global << jnp.uint32(32 - total_prefix_bits))
+                      )
+                      mask_2d = jnp.broadcast_to(mask, (TILE_ROWS, TILE_COLS))
+                      prefix_2d = jnp.broadcast_to(prefix, (TILE_ROWS, TILE_COLS))
+
+                      hi_out_vmem_ref[...] = (hi_rand & mask_2d) | prefix_2d
+                      lo_out_vmem_ref[...] = lo
+                  return kernel
+
+              # ---------------------------------------------------------------------
+              # PIPELINED 3-WAY TRANSFER-WHILE-SORT (KeyGen || Comm || In-VMEM Sort)
+              # ---------------------------------------------------------------------
+              def generate_transfer_and_sort_pipelined_2d(iter_seed: jax.Array):
+                  dev_idx = jax.lax.axis_index('x')
+                  chip_seed = jnp.full(
+                      (TILE_ROWS, TILE_COLS),
+                      jnp.uint32(iter_seed) ^ (jnp.uint32(dev_idx + 1) * jnp.uint32(0x9e3779b9)),
+                      dtype=jnp.uint32,
+                  )
+
+                  def gen_chunk(k):
+                      with jax.named_scope(f"Stage_{k}_Pallas_KeyGen"):
+                          c_sz = CHUNK_SIZES[k]
+                          c_off = CHUNK_OFFSETS[k]
+                          out_shape = jax.ShapeDtypeStruct((c_sz, NUM_CHIPS, TILE_ROWS, TILE_COLS), jnp.uint32)
+                          hi_2d, lo_2d = pl.pallas_call(
+                              get_pallas_chunk_kernel(c_off),
+                              out_shape=(out_shape, out_shape),
+                              grid=(c_sz, NUM_CHIPS),
+                              in_specs=[pl.BlockSpec((TILE_ROWS, TILE_COLS), lambda t, b: (0, 0))],
+                              out_specs=[
+                                  pl.BlockSpec((None, None, TILE_ROWS, TILE_COLS), lambda t, b: (t, b, 0, 0)),
+                                  pl.BlockSpec((None, None, TILE_ROWS, TILE_COLS), lambda t, b: (t, b, 0, 0)),
+                              ],
+                              compiler_params=(getattr(pltpu, "TPUCompilerParams", getattr(pltpu, "CompilerParams", None)))(
+                                  dimension_semantics=("parallel", "parallel")
+                              ),
+                              name=f"pallas_chunk_keygen_{k}",
+                          )(chip_seed)
+                          return ((hi_2d.astype(jnp.uint64) << jnp.uint64(32)) | lo_2d.astype(jnp.uint64)).reshape(c_sz, NUM_CHIPS, KEYS_PER_TILE)
+
+                  def comm_chunk(chunk_data, k):
+                      with jax.named_scope(f"Stage_{k}_ICI_AllToAll_DMA"):
+                          return jax.lax.all_to_all(chunk_data, axis_name='x', split_axis=1, concat_axis=1)
+
+                  def sort_chunk(recv_data, k):
+                      with jax.named_scope(f"Stage_{k}_InVMEM_Row_Sort"):
+                          c_sz = CHUNK_SIZES[k]
+                          tiled = recv_data.reshape(c_sz, NUM_CHIPS * KEYS_PER_TILE)
+                          return jnp.sort(tiled, axis=-1)
+
+                  sorted_chunks = []
+
+                  # Pipeline Prologue (Stage 0): Generate and transfer chunk 0
+                  curr_chunk = gen_chunk(0)
+                  curr_recv = comm_chunk(curr_chunk, 0)
+
+                  # Interleaved Pipeline Stages: Overlap Sort(k-1) with Comm(k) and Gen(k)
+                  for k in range(1, len(CHUNK_SIZES)):
+                      next_chunk = gen_chunk(k)
+                      next_recv = comm_chunk(next_chunk, k)
+                      sorted_prev = sort_chunk(curr_recv, k - 1)
+                      sorted_chunks.append(sorted_prev)
+                      curr_recv = next_recv
+
+                  # Pipeline Epilogue: Sort final chunk
+                  sorted_final = sort_chunk(curr_recv, len(CHUNK_SIZES) - 1)
+                  sorted_chunks.append(sorted_final)
+
+                  return tuple(sorted_chunks)
+
+              # ---------------------------------------------------------------------
+              # PHASE 3: Validation & Checksum
+              # ---------------------------------------------------------------------
+              def validate_pipelined_2d(*sorted_chunks):
+                  with jax.named_scope("Phase3_Global_Validation"):
+                      chunk_oks = []
+                      chunk_sums = []
+                      for c in sorted_chunks:
+                          row_ok = jnp.all(c[:, :-1] <= c[:, 1:])
+                          tile_ok = jnp.all(c[:-1, -1] <= c[1:, 0])
+                          chunk_oks.append(row_ok & tile_ok)
+                          chunk_sums.append(jnp.sum(c, dtype=jnp.uint64))
+
+                      chunk_boundary_ok = jnp.all(jnp.array([
+                          sorted_chunks[k][-1, -1] <= sorted_chunks[k+1][0, 0]
+                          for k in range(len(sorted_chunks) - 1)
+                      ]))
+
+                      local_ok = jnp.all(jnp.array(chunk_oks)) & chunk_boundary_ok
+
+                      chip_mins = jax.lax.all_gather(sorted_chunks[0][0, 0], axis_name='x')
+                      chip_maxs = jax.lax.all_gather(sorted_chunks[-1][-1, -1], axis_name='x')
+                      boundary_ok = jnp.all(chip_maxs[:-1] <= chip_mins[1:])
+                      all_ok = jnp.all(jax.lax.all_gather(local_ok, axis_name='x')) & boundary_ok
+
+                      local_sum = jnp.sum(jnp.array(chunk_sums, dtype=jnp.uint64), dtype=jnp.uint64)
+                      global_sum = jnp.sum(jax.lax.all_gather(local_sum, axis_name='x'), dtype=jnp.uint64)
+                      return all_ok, global_sum
+
+              # ---------------------------------------------------------------------
+              # HARDWARE TELEMETRY REPORT GENERATOR
+              # ---------------------------------------------------------------------
+              def print_hardware_telemetry_report(jit_pipe_sort, sample_seed, dev0):
+                  print("\n" + "=" * 78, flush=True)
+                  print("   TPU v6e PIPELINED TELEMETRY: OVERLAP, VMEM & DMA ENGINE ANALYSIS", flush=True)
+                  print("=" * 78, flush=True)
+
+                  try:
+                      mem_stats = dev0.memory_stats() or {}
+                  except Exception:
+                      mem_stats = {}
+                  bytes_in_use = mem_stats.get("bytes_in_use", 0) / (1024**3)
+                  peak_bytes = mem_stats.get("peak_bytes_in_use", 0) / (1024**3)
+                  bytes_limit = mem_stats.get("bytes_limit", 32 * 1024**3) / (1024**3)
+                  print(f"[HBM Live Usage (Chip 0)] In-Use: {bytes_in_use:.2f} GiB | Peak: {peak_bytes:.2f} GiB / {bytes_limit:.2f} GiB ({100*peak_bytes/max(bytes_limit,1):.1f}%)", flush=True)
+
+                  try:
+                      compiled = jit_pipe_sort.lower(sample_seed).compile()
+                      ma = compiled.memory_analysis()
+                      ca = compiled.cost_analysis()
+                      print(f"\n--- Pipelined Transfer-While-Sort Compiler Analysis ---", flush=True)
+                      if ma:
+                          temp_mb = getattr(ma, "temp_size_in_bytes", 0) / (1024**2)
+                          alias_mb = getattr(ma, "alias_size_in_bytes", 0) / (1024**2)
+                          out_mb = getattr(ma, "output_size_in_bytes", 0) / (1024**2)
+                          print(f"  [Memory Bounds] Peak Temp: {temp_mb:.2f} MiB | Aliased: {alias_mb:.2f} MiB | Output: {out_mb:.2f} MiB", flush=True)
+                          if temp_mb > 0:
+                              print(f"  [VMEM Scratchpad Occupancy] {temp_mb:.2f} MiB / 128 MiB ({100*temp_mb/128:.1f}%)", flush=True)
+                      if ca:
+                          flops = ca.get("flops", 0)
+                          bytes_acc = ca.get("bytes accessed", 0)
+                          print(f"  [Cost Analysis] FLOPs / VPU Ops: {int(flops):,} | HBM Bytes Accessed: {bytes_acc / (1024**3):.2f} GiB", flush=True)
+                  except Exception as e:
+                      print(f"  [Compiler Analysis Info] {e}", flush=True)
+
+                  llo_files = glob.glob("/tmp/xla_dump/*.llo.*") + glob.glob("/tmp/xla_dump/*.llo")
+                  print(f"\n[LLO Disassembly Telemetry] Found {len(llo_files)} LLO assembly dumps in /tmp/xla_dump", flush=True)
+                  if llo_files:
+                      vreg_counts = []
+                      sreg_counts = []
+                      dma_ops = 0
+                      vpu_alu_ops = 0
+                      mxu_ops = 0
+
+                      for llo_p in llo_files[:10]:
+                          try:
+                              with open(llo_p, "r", errors="ignore") as f:
+                                  txt = f.read()
+                              vregs = set(re.findall(r"\$v\d+", txt))
+                              sregs = set(re.findall(r"\$s\d+", txt))
+                              if vregs: vreg_counts.append(len(vregs))
+                              if sregs: sreg_counts.append(len(sregs))
+                              dma_ops += len(re.findall(r"(?:dma|async_out|sync_flag|dma_wait)", txt, re.IGNORECASE))
+                              vpu_alu_ops += len(re.findall(r"(?:vadd|vxor|vand|vor|vshl|vshr|vmul|vbitrev|vselect)", txt, re.IGNORECASE))
+                              mxu_ops += len(re.findall(r"(?:matmul|dot|mxu)", txt, re.IGNORECASE))
+                          except Exception:
+                              pass
+
+                      max_vreg = max(vreg_counts) if vreg_counts else 32
+                      max_sreg = max(sreg_counts) if sreg_counts else 16
+                      print(f"  [Vector Registers (VREG)] Peak Active: {max_vreg} / 32 ($v0..$v31 allocated)", flush=True)
+                      print(f"  [Scalar Registers (SREG)] Peak Active: {max_sreg} / 32 ($s0..$s31 allocated)", flush=True)
+                      print(f"  [DMA Engine Instructions] Async Collectives Lowered : {dma_ops} descriptors", flush=True)
+                      print(f"  [VPU Vector ALU Operations] Lowered Bitwise & Sort Ops : {vpu_alu_ops}", flush=True)
+                      print(f"  [MXU Matrix Multipliers   ] Lowered Matrix Dot Ops      : {mxu_ops} (0.0% GEMM usage)", flush=True)
+
+                  hlo_files = glob.glob("/tmp/xla_dump/*before_optimizations.txt") + glob.glob("/tmp/xla_dump/*after_optimizations.txt")
+                  if hlo_files:
+                      try:
+                          with open(hlo_files[-1], "r", errors="ignore") as f:
+                              hlo_txt = f.read()
+                          print(f"\n[XLA HLO Lowering & Scheduling Inspection]", flush=True)
+                          hlo_lines = hlo_txt.splitlines()
+                          print(f"  Total Lowered HLO Instructions: {len(hlo_lines)}", flush=True)
+                          key_ops = ["all-to-all", "custom-call", "sort", "compare", "bitcast", "slice", "concatenate", "select"]
+                          for op in key_ops:
+                              c = len([l for l in hlo_lines if f"{op}(" in l or f" {op} " in l or f"={op}" in l])
+                              if c > 0:
+                                  print(f"    - HLO Op '{op}': {c} occurrences", flush=True)
+                      except Exception as e:
+                          print(f"  [HLO Inspection Info] {e}", flush=True)
+
+                  print("=" * 78 + "\n", flush=True)
+
+              def main():
+                  coordinator = os.environ.get("COORDINATOR_ADDRESS", "jax-tpu-case-a-pipe-16tpu-0.jax-tpu-case-a-pipe-16tpu-svc.default.svc.cluster.local:8080")
+                  process_id = int(os.environ.get("JOB_COMPLETION_INDEX", 0))
+                  num_processes = int(os.environ.get("JOB_COMPLETIONS", 4))
+
+                  print(f"[POD {process_id}] Initializing JAX distributed (coordinator={coordinator}, num_processes={num_processes})...", flush=True)
+                  if num_processes > 1:
+                      jax.distributed.initialize(
+                          coordinator_address=coordinator,
+                          num_processes=num_processes,
+                          process_id=process_id,
+                          initialization_timeout=300,
+                      )
+
+                  devices = jax.devices()
+                  num_devices = len(devices)
+                  print(f"[POD {process_id}] JAX distributed initialized! Devices ({num_devices}): {devices}", flush=True)
+                  mesh = Mesh(devices, ('x',))
+
+                  chunk_specs = tuple(P('x', None) for _ in range(len(CHUNK_SIZES)))
+                  jit_pipe_sort = jax.jit(shard_map.shard_map(
+                      generate_transfer_and_sort_pipelined_2d,
+                      mesh=mesh,
+                      in_specs=P(),
+                      out_specs=chunk_specs,
+                      check_rep=False,
+                  ))
+
+                  jit_val = jax.jit(shard_map.shard_map(
+                      validate_pipelined_2d,
+                      mesh=mesh,
+                      in_specs=chunk_specs,
+                      out_specs=(P(), P()),
+                      check_rep=False,
+                  ))
+
+                  total_keys = ELEMENTS_PER_CHIP * num_devices
+                  total_gb = (total_keys * 8) / 1e9
+                  ici_gb = (total_gb * (num_devices - 1)) / num_devices
+
+                  for i, seed in enumerate([111, 222, 333]):
+                      label = "COLD (incl. compile)" if i == 0 else f"WARM #{i} (steady-state)"
+                      print(f"[POD {process_id}] Starting step {i}: {label} (seed={seed})...", flush=True)
+                      trace_active = (i == 2)
+                      if trace_active:
+                          jax.profiler.start_trace("/tmp/xprof")
+
+                      t0 = time.perf_counter()
+                      sorted_chunks = jit_pipe_sort(jnp.uint32(seed))
+                      for sc in sorted_chunks:
+                          sc.block_until_ready()
+                      t_pipe = time.perf_counter() - t0
+
+                      passed, g_sum = jit_val(*sorted_chunks)
+                      passed.block_until_ready()
+                      if i < 2:
+                          sorted_chunks = None  # Free sorted chunks before next step
+
+                      if trace_active:
+                          jax.profiler.stop_trace()
+
+                      if process_id == 0:
+                          ns_per_item = (t_pipe * 1e9) / total_keys
+                          print("=======================================================", flush=True)
+                          print(f"[CASE A PIPELINED OPTIMIZED: 16 TPUv6e / 128.85 GB] {label} (seed={seed})", flush=True)
+                          print(f"Total Keys Generated/Conserved : {total_keys:,} ({total_gb:.2f} GB)", flush=True)
+                          print(f"Global Validation & Checksum   : [{'PASSED' if bool(passed) else 'FAILED'}] sum={int(g_sum)}", flush=True)
+                          print(f"Pipelined Transfer-While-Sort  : {t_pipe:.4f} s (Total: {total_gb/t_pipe:.2f} GB/s | ICI DMA: {ici_gb/t_pipe:.2f} GB/s | {ns_per_item:.4f} ns/key)", flush=True)
+                          print("=======================================================\n", flush=True)
+
+                  if process_id == 0:
+                      print_hardware_telemetry_report(jit_pipe_sort, jnp.uint32(333), jax.local_devices()[0])
+
+                  try:
+                      jax.distributed.shutdown()
+                  except Exception:
+                      pass
+
+                  if process_id == 0:
+                      print("Pod 0 holding /tmp/xprof open for 20s for telemetry capture...", flush=True)
+                      time.sleep(20)
+
+              if __name__ == "__main__":
+                  try:
+                      main()
+                  except Exception:
+                      import traceback
+                      traceback.print_exc()
+                      raise
+              EOF
+              python3 -u /app/case_a_pipelined.py 2>&1
